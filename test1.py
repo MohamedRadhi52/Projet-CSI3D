@@ -2,6 +2,7 @@
 
 import obja
 import numpy as np
+import heapq
 
 
 class Collapse:
@@ -31,6 +32,67 @@ class ProgressiveMesh(obja.Model):
         return np.linalg.norm(
             self.vertices[a] - self.vertices[b]
         )
+    import numpy as np
+
+    # -----------------------------
+    # QEM simplifié
+    # -----------------------------
+
+    def edge_length_qem(self, a, b):
+        """
+        Approximation QEM :
+        coût = longueur * importance locale
+        """
+
+        length = np.linalg.norm(
+            self.vertices[a] - self.vertices[b]
+        )
+
+        degree_a = 0
+        degree_b = 0
+
+        for face in self.faces:
+
+            if not face.visible:
+                continue
+
+            verts = [face.a, face.b, face.c]
+
+            if a in verts:
+                degree_a += 1
+
+            if b in verts:
+                degree_b += 1
+
+        return length * (1 + 0.1 * (degree_a + degree_b))
+
+    # -----------------------------
+    # Priority Queue
+    # -----------------------------
+
+    def shortest_edge_heap(self):
+
+        edges = self.collect_edges()
+
+        if len(edges) == 0:
+            return None
+
+        heap = []
+
+        for edge in edges:
+
+            a, b = edge
+
+            cost = self.edge_length_qem(a, b)
+
+            heapq.heappush(
+                heap,
+                (cost, edge)
+            )
+
+        _, best_edge = heapq.heappop(heap)
+
+        return best_edge
 
     def collect_edges(self):
 
@@ -126,7 +188,8 @@ class ProgressiveMesh(obja.Model):
 
         while self.count_visible_faces() > target_faces:
 
-            edge = self.shortest_edge()
+            #edge = self.shortest_edge()
+            edge = self.shortest_edge_heap()
 
             if edge is None:
                 break
