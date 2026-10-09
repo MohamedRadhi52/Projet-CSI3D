@@ -26,48 +26,127 @@ class ProgressiveMesh(obja.Model):
     # -----------------------------
     # Géométrie
     # -----------------------------
-
-    def edge_length(self, a, b):
-        return np.linalg.norm(
-            self.vertices[a] - self.vertices[b]
-        )
-
-    def collect_edges(self):
-
-        edges = set()
-
+    def collect_edge_neighborhood(self, a, b):
+        """
+        Collecte le voisinage local de l'edge collapse (faces autour de a et b).
+        """
+        voisinage = []
         for face in self.faces:
-
             if not face.visible:
                 continue
+            verts = [face.a, face.b, face.c]
+            if a in verts or b in verts:
+                voisinage.append(face.clone())
+        return voisinage
+    
+    def edge_length(self, a, b):
+        """
+        Calcule le cout estime du collapse de l'arete (a, b).
 
-            edges.add(tuple(sorted((face.a, face.b))))
-            edges.add(tuple(sorted((face.b, face.c))))
-            edges.add(tuple(sorted((face.c, face.a))))
+        D'apres Hoppe et al., Section 4.3:
+            E = E_dist + E_spring
 
-        return list(edges)
+        E_dist mesure la deformation geometrique locale.
+        E_spring penalise les aretes trop longues.
+        """
+        # 1. Construire le voisinage local de l'edge collapse (faces autour de a et b).
+        voisinage = self.collect_edge_neighborhood(a, b)
+        # 2. Choisir la position candidate du sommet conserve apres le collapse.
+        if len(voisinage) == 0:
+            return 0.0
+        sommet_a = self.vertices[a]
+        sommet_b = self.vertices[b]
+        position_candidate = (sommet_a + sommet_b) / 2.0
 
-    def shortest_edge(self):
+        # 3. Evaluer l'erreur geometrique E_dist entre le maillage actuel
+        #    et le maillage obtenu apres la contraction.
+        e_dist = 0.0
+        for face in voisinage:
+            v1 = self.vertices[face.a]
+            v2 = self.vertices[face.b]
+            v3 = self.vertices[face.c]
+            normale = np.cross(v2 - v1, v3 - v1)
+            norme =  np.linalg.norm(normale)
+            if norme == 0:
+                continue
+            normale /= norme
+            distance = np.dot(position_candidate - v1, normale)
+            e_dist += distance**2
+        # 4. Ajouter, si elle est utilisee, l'energie de regularisation E_spring.
+        e_spring = np.linalg.norm(sommet_a - sommet_b)
+        # 5. Retourner E = E_dist + E_spring comme priorite du collapse.
+        cout_total = e_dist + e_spring
+        # La longueur seule ne doit donc plus etre le cout final.
+        return cout_total
 
-        edges = self.collect_edges()
 
-        if len(edges) == 0:
-            return None
+def collect_edges(self):
+    """
+    Construit les candidats d'edge collapse et les structures de voisinage.
+    Hoppe et al. [9], Sections 4.1 et 4.3:
+    les collapses candidats doivent etre analyses localement,
+    puis evalues selon leur cout et leur legalite topologique.
+    """
+    # Ensemble des aretes uniques du maillage.
+    edges = set()
+    # Faces adjacentes a chaque arete.
+    self.edge_faces = {}
+    # Sommets voisins de chaque sommet.
+    self.vertex_neighbors = {
+        vertex_id: set()
+        for vertex_id in range(len(self.vertices))
+    }
+    for face in self.faces:
+        # Une face invisible ne participe plus au maillage courant.
+        if not face.visible:
+            continue
+        # Les trois aretes de la face.
+        face_edges = [
+            (face.a, face.b),
+            (face.b, face.c),
+            (face.c, face.a)
+        ]
+        for first_vertex, second_vertex in face_edges:
+            # Une arete est representee dans un ordre unique.
+            edge = tuple(sorted((first_vertex, second_vertex)))
+            # Ignorer une arete degener ee.
+            if edge[0] == edge[1]:
+                continue
+            # Ajouter l'arete aux candidats.
+            edges.add(edge)
+            # Enregistrer la face adjacente a cette arete.
+            self.edge_faces.setdefault(edge, set()).add(face)
+            # Construire le voisinage des sommets.
+            self.vertex_neighbors[first_vertex].add(second_vertex)
+            self.vertex_neighbors[second_vertex].add(first_vertex)
+    # Retourner toutes les aretes candidates uniques.
+    return list(edges)
 
-        best_edge = None
-        best_cost = float("inf")
-
-        for edge in edges:
-
-            a, b = edge
-
-            cost = self.edge_length(a, b)
-
-            if cost < best_cost:
-                best_cost = cost
-                best_edge = edge
-
-        return best_edge
+def shortest_edge(self):
+    """
+    Selectionne le collapse ayant le plus petit cout estime.
+    Hoppe et al. [9], Section 4.3:
+    les transformations candidates sont classees dans une priority queue
+    selon leur cout E.
+    """
+    import heapq
+    edges = self.collect_edges()
+    if not edges:
+        return None
+    priority_queue = []
+    for edge in edges:
+        first_vertex, second_vertex = edge
+        cost = self.edge_length(first_vertex, second_vertex)
+        heapq.heappush(
+            priority_queue,
+            (cost, edge)
+        )
+    while priority_queue:
+        cost, edge = heapq.heappop(priority_queue)
+        first_vertex, second_vertex = edge
+        # Le test de legalite complet sera ajoute ici.
+        return edge
+    return None
 
     # -----------------------------
     # Collapse simple
