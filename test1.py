@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""Transformation OBJ -> OBJA par QEM, dans le programme initial du projet.
-
-Utilisation : python test1.py suzanne --ratio 0.1 --samples 2000
-
-QEM de Garland-Heckbert, variante de demi-contractions : on évalue les deux
-extrémités de chaque arête et on conserve celle de plus faible coût admissible.
-Pas d'optimisation continue de position, ni d'agrégation de sommets non reliés.
-Les sommets ne bougent pas : le parseur et le visualiseur OBJA restent inchangés.
-La sortie contient la base et les inverses des contractions. Le format texte
-progressif peut être plus lourd que l'OBJ ; aucune compression binaire ajoutée.
-"""
 
 import argparse
 import csv
@@ -23,9 +12,6 @@ import numpy as np
 import obja
 
 class Collapse:
-    """
-    Informations nécessaires pour reconstruire.
-    """
 
     def __init__(self, vertex_id, vertex_position, faces, target_id,
                  target_position, faces_before, quadrics_before):
@@ -52,7 +38,6 @@ class ProgressiveMesh(obja.Model):
 
 
     def collect_edges(self):
-        """Retourne les arêtes uniques des faces visibles, dans un ordre stable."""
 
         # L'ensemble élimine les arêtes communes à plusieurs triangles.
         edges = set()
@@ -71,7 +56,6 @@ class ProgressiveMesh(obja.Model):
 
 
     def face_plane(self, face):
-        """Retourne [a, b, c, d] avec une normale unitaire, ou None si dégénérée."""
         p0, p1, p2 = (self.vertices[i] for i in (face.a, face.b, face.c))
         edge1 = p1 - p0
         edge2 = p2 - p0
@@ -87,12 +71,6 @@ class ProgressiveMesh(obja.Model):
 
 
     def compute_initial_quadrics(self):
-        """Construit Q_v = somme des p p^T des faces visibles incidentes.
-
-        À calculer avant la simplification. Pour QEM, les contractions devront
-        ensuite additionner ces quadriques historiques, pas les recalculer
-        à partir des seules faces restantes.
-        """
         quadrics = np.zeros((len(self.vertices), 4, 4))
         skipped = 0
         for face in self.faces:
@@ -110,7 +88,6 @@ class ProgressiveMesh(obja.Model):
 
 
     def qem_cost(self, vs, vt):
-        """Erreur de vs -> vt, évaluée à la position inchangée de vt."""
         if self.quadrics is None:
             self.quadrics, _ = self.compute_initial_quadrics()
         quadric = self.quadrics[vs] + self.quadrics[vt]
@@ -176,7 +153,6 @@ class ProgressiveMesh(obja.Model):
 
 
     def mesh_context(self):
-        """Voisinages actuels pour les coûts locaux et les contrôles communs."""
         incident = [set() for _ in self.vertices]
         adjacent = [set() for _ in self.vertices]
         edge_faces = {}
@@ -204,10 +180,6 @@ class ProgressiveMesh(obja.Model):
 
 
     def legal_collapse(self, vs, vt, context):
-        """Lien local, bords, triangles aplatis/inversés et faces dupliquées.
-
-        Ces tests communs ne détectent pas toutes les auto-intersections globales.
-        """
         incident, adjacent, edge_faces, normals, boundary = context
         shared = edge_faces.get(tuple(sorted((vs, vt))), [])
         if len(shared) not in (1, 2):
@@ -252,11 +224,6 @@ class ProgressiveMesh(obja.Model):
 
     def write_obja(self, output):
 
-        """Écrit la base simplifiée puis les opérations inverses des contractions.
-
-        Version pédagogique : toutes les positions sont écrites au départ.
-        Valable pour nos demi-contractions, qui ne déplacent aucun sommet.
-        """
         output_model = obja.Output(output, random_color=False)
         output.write("# Sommets : positions conservees pendant les contractions\n")
         for vertex_id, position in enumerate(self.vertices):
@@ -280,12 +247,6 @@ class ProgressiveMesh(obja.Model):
 
 
     def simplify(self, target_ratio=0.1):
-        """QEM uniquement, avec quadriques historiques et tas de coûts locaux.
-
-        Contrôles de lien, de bord, de doublons et d'orientation. Ils ne
-        constituent pas une détection globale de toutes les auto-intersections.
-        La cible n'est pas franchie ; l'arrêt peut rester au-dessus de celle-ci.
-        """
         if not math.isfinite(target_ratio) or not 0 < target_ratio <= 1:
             raise ValueError("Le ratio doit appartenir à ]0,1].")
         if self.quadrics is None:
@@ -351,10 +312,6 @@ def sample_surface(triangles, count, seed):
 
 
 def surface_distances(points, triangles):
-    """Minimum exact sur les triangles cibles, pour chaque point échantillonné.
-
-    Lots sur les points ET les triangles pour borner la mémoire sur Bunny.
-    """
     result = np.empty(len(points))
     for start in range(0, len(points), 32):
         p = points[start:start+32, None, :]
