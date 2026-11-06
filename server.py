@@ -61,6 +61,9 @@ class RequestHandler(SimpleHTTPRequestHandler):
         in_file.seek(self.range_from)
         # Add 1 because the range is inclusive
         left_to_copy = 1 + self.range_to - self.range_from
+
+        print(f"[RANGE REQUEST] Envoi des octets {self.range_from} à {self.range_to} (Taille: {left_to_copy})")
+        
         buf_length = 64 * 1024
         bytes_copied = 0
         while bytes_copied < left_to_copy:

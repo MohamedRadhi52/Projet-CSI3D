@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import heapq
@@ -6,182 +7,613 @@ import numpy as np
 import obja
 
 
-class Collapse:
-    def __init__(self, vs, vs_pos, vt, vt_pos, cost, removed_faces):
-        self.vertex_id = vs
-        self.vertex_position = np.copy(vs_pos)
-        self.target_vertex = vt
-        self.target_position = np.copy(vt_pos)
-        self.collapse_cost = cost
-        # Sauvegarde une copie exacte des faces supprimées AVANT modification
-        self.faces = [f.clone() for f in removed_faces]
-
-
 class ProgressiveMesh(obja.Model):
 
     def __init__(self):
         super().__init__()
-        self.history = []
 
-    def collect_edges(self):
-        edges = set()
-        for face in self.faces:
-            if not face.visible:
+        self.active_faces = []
+        self.quadrics = []
+        self.operations = []
+
+        self.neighbors = []
+        self.incident_faces = []
+        self.edge_faces = {}
+
+        self.edge_versions = {}
+        self.heap = []
+        self.heap_counter = 0
+
+        self.boundary_weight = 10.0
+        self.feature_weight = 5.0
+        self.feature_angle = 45.0
+
+    def initialize(self):
+        self.vertices = [
+            np.asarray(v, dtype=float).copy()
+            for v in self.vertices
+        ]
+
+        self.active_faces = [bool(f.visible) for f in self.faces]
+        self.operations = []
+        self.edge_versions = {}
+        self.heap = []
+        self.heap_counter = 0
+
+        self.build_topology()
+        self.compute_quadrics()
+
+    def compute_quadrics(self):
+        self.quadrics = [
+            np.zeros((4, 4), dtype=float)
+            for _ in self.vertices
+        ]
+
+        face_normals = {}
+        edges = {}
+
+        for i, face in enumerate(self.faces):
+            if not self.active_faces[i]:
                 continue
-            verts = [face.a, face.b, face.c]
-            for i in range(3):
-                u, v = verts[i], verts[(i + 1) % 3]
-                edges.add((min(u, v), max(u, v)))
-        return edges
 
-    def edge_length_qem(self, a, b):
-        length = np.linalg.norm(self.vertices[a] - self.vertices[b])
-        degree_a = sum(1 for f in self.faces if f.visible and a in (f.a, f.b, f.c))
-        degree_b = sum(1 for f in self.faces if f.visible and b in (f.a, f.b, f.c))
-        return length * (1.0 + 0.1 * (degree_a + degree_b))
+            a, b, c = face.a, face.b, face.c
+            p1, p2, p3 = self.vertices[a], self.vertices[b], self.vertices[c]
 
-    def build_heap(self):
-        heap = []
-        for a, b in self.collect_edges():
-            cost = self.edge_length_qem(a, b)
-            heapq.heappush(heap, (cost, (a, b)))
-        return heap
+            normal = np.cross(p2 - p1, p3 - p1)
+            length = np.linalg.norm(normal)
 
-    def compute_barycenter(self, vs, vt):
-        neighbors = set()
-        for face in self.faces:
-            if not face.visible:
+            if length < 1e-12:
                 continue
-            verts = [face.a, face.b, face.c]
-            if vs in verts or vt in verts:
-                for v in verts:
-                    if v != vs and v != vt:
-                        neighbors.add(v)
 
-        points = [self.vertices[vs], self.vertices[vt]]
-        for n in neighbors:
-            points.append(self.vertices[n])
+            normal /= length
+            face_normals[i] = normal
 
-        return np.mean(points, axis=0)
+            plane = np.append(normal, -np.dot(normal, p1))
+            quadric = np.outer(plane, plane)
+
+            self.quadrics[a] += quadric
+            self.quadrics[b] += quadric
+            self.quadrics[c] += quadric
+
+            for u, v in ((a, b), (b, c), (c, a)):
+                edge = (min(u, v), max(u, v))
+                edges.setdefault(edge, []).append(i)
+
+        threshold = np.cos(np.radians(self.feature_angle))
+
+        for (u, v), incident in edges.items():
+            if len(incident) == 1:
+                normal = face_normals.get(incident[0])
+                weight = self.boundary_weight
+
+            elif len(incident) == 2:
+                n1 = face_normals.get(incident[0])
+                n2 = face_normals.get(incident[1])
+
+                if n1 is None or n2 is None:
+                    continue
+
+                if np.dot(n1, n2) >= threshold:
+                    continue
+
+                normal = n1 + n2
+                length = np.linalg.norm(normal)
+
+                if length < 1e-12:
+                    continue
+
+                normal /= length
+                weight = self.feature_weight
+
+            else:
+                continue
+
+            if normal is None:
+                continue
+
+            direction = self.vertices[v] - self.vertices[u]
+            length = np.linalg.norm(direction)
+
+            if length < 1e-12:
+                continue
+
+            direction /= length
+            constraint = np.cross(direction, normal)
+            length = np.linalg.norm(constraint)
+
+            if length < 1e-12:
+                continue
+
+            constraint /= length
+            plane = np.append(
+                constraint,
+                -np.dot(constraint, self.vertices[u])
+            )
+
+            quadric = weight * np.outer(plane, plane)
+            self.quadrics[u] += quadric
+            self.quadrics[v] += quadric
+
+    def build_topology(self):
+        count = len(self.vertices)
+
+        self.neighbors = [set() for _ in range(count)]
+        self.incident_faces = [set() for _ in range(count)]
+        self.edge_faces = {}
+
+        for i, face in enumerate(self.faces):
+            if self.active_faces[i]:
+                self.add_face_topology(i, face)
+
+    def add_face_topology(self, index, face):
+        a, b, c = face.a, face.b, face.c
+
+        for vertex in (a, b, c):
+            self.incident_faces[vertex].add(index)
+
+        for u, v in ((a, b), (b, c), (c, a)):
+            edge = (min(u, v), max(u, v))
+            self.neighbors[u].add(v)
+            self.neighbors[v].add(u)
+            self.edge_faces.setdefault(edge, []).append(index)
+
+    def remove_face_topology(self, index, face):
+        a, b, c = face.a, face.b, face.c
+
+        for vertex in (a, b, c):
+            self.incident_faces[vertex].discard(index)
+
+        for u, v in ((a, b), (b, c), (c, a)):
+            edge = (min(u, v), max(u, v))
+            incident = self.edge_faces.get(edge)
+
+            if incident is None:
+                continue
+
+            if index in incident:
+                incident.remove(index)
+
+            if not incident:
+                del self.edge_faces[edge]
+                self.neighbors[u].discard(v)
+                self.neighbors[v].discard(u)
+
+    def update_local_topology(self, old_faces, changed):
+        for i, face in old_faces:
+            self.remove_face_topology(i, face)
+
+        for i, face in changed:
+            self.add_face_topology(i, face)
 
     def is_valid_edge(self, u, v):
-        for face in self.faces:
-            if not face.visible:
+        edge = (min(u, v), max(u, v))
+        incident = self.edge_faces.get(edge, [])
+
+        if len(incident) not in (1, 2):
+            return False
+
+        common = self.neighbors[u] & self.neighbors[v]
+        opposite = set()
+
+        for i in incident:
+            face = self.faces[i]
+            opposite.update(
+                x for x in (face.a, face.b, face.c)
+                if x != u and x != v
+            )
+
+        if common != opposite:
+            return False
+
+        if len(incident) == 1:
+            return True
+
+        normals = []
+
+        for i in incident:
+            face = self.faces[i]
+            a, b, c = (
+                self.vertices[x]
+                for x in (face.a, face.b, face.c)
+            )
+
+            normal = np.cross(b - a, c - a)
+            length = np.linalg.norm(normal)
+
+            if length < 1e-12:
+                return False
+
+            normals.append(normal / length)
+
+        threshold = np.cos(np.radians(self.feature_angle))
+        return np.dot(normals[0], normals[1]) >= threshold
+
+    def get_candidate_positions(self, u, v):
+        quadric = self.quadrics[u] + self.quadrics[v]
+        p1, p2 = self.vertices[u], self.vertices[v]
+
+        positions = []
+        matrix = quadric[:3, :3]
+        vector = -quadric[:3, 3]
+
+        try:
+            optimal = np.linalg.solve(matrix, vector)
+
+            if np.all(np.isfinite(optimal)):
+                positions.append(optimal)
+
+        except np.linalg.LinAlgError:
+            pass
+
+        positions.extend((p1, p2, (p1 + p2) * 0.5))
+
+        candidates = []
+        seen = []
+
+        for position in positions:
+            position = np.asarray(position, dtype=float)
+
+            if not np.all(np.isfinite(position)):
                 continue
-            verts = [face.a, face.b, face.c]
-            if u in verts and v in verts:
-                return True
-        return False
 
-    def collapse_edge_improved(self, vs, vt, cost):
-        removed_faces = []
-
-        old_vs_pos = np.copy(self.vertices[vs])
-        old_vt_pos = np.copy(self.vertices[vt])
-
-        # 1. Identifier et cloner les faces qui vont être supprimées (dégénérées)
-        for face in self.faces:
-            if not face.visible:
+            if any(np.linalg.norm(position - p) < 1e-10 for p in seen):
                 continue
 
-            verts = [face.a, face.b, face.c]
-            if vs in verts:
-                new_verts = [vt if v == vs else v for v in verts]
-                if len(set(new_verts)) < 3:
-                    # Copie de l'état ORIGINAL de la face avant suppression
-                    removed_faces.append(face.clone())
-                    face.visible = False
+            seen.append(position.copy())
 
-        # 2. Appliquer le déplacement géométrique
-        self.vertices[vt] = self.compute_barycenter(vs, vt)
+            point = np.append(position, 1.0)
+            cost = float(point @ quadric @ point)
 
-        # 3. Mettre à jour les faces restantes
-        for face in self.faces:
-            if not face.visible:
+            if np.isfinite(cost):
+                candidates.append((max(0.0, cost), position.copy()))
+
+        candidates.sort(key=lambda x: x[0])
+        return candidates
+
+    def check_geometry(self, u, v, position):
+        faces = self.incident_faces[u] | self.incident_faces[v]
+
+        for i in faces:
+            face = self.faces[i]
+            indices = (face.a, face.b, face.c)
+
+            if u in indices and v in indices:
                 continue
-            if face.a == vs: face.a = vt
-            if face.b == vs: face.b = vt
-            if face.c == vs: face.c = vt
 
-        # 4. Enregistrer dans l'historique
-        self.history.append(
-            Collapse(vs, old_vs_pos, vt, old_vt_pos, cost, removed_faces)
+            old_points = [self.vertices[x] for x in indices]
+
+            new_points = [
+                position if x == u or x == v else self.vertices[x]
+                for x in indices
+            ]
+
+            old_normal = np.cross(
+                old_points[1] - old_points[0],
+                old_points[2] - old_points[0]
+            )
+
+            new_normal = np.cross(
+                new_points[1] - new_points[0],
+                new_points[2] - new_points[0]
+            )
+
+            if np.linalg.norm(new_normal) < 1e-12:
+                return False
+
+            if np.dot(old_normal, new_normal) <= 0.0:
+                return False
+
+        return True
+
+    def prepare_collapse(self, u, v):
+        changed = []
+        removed = []
+
+        for i in self.incident_faces[u]:
+            face = self.faces[i]
+
+            vertices = [
+                v if x == u else x
+                for x in (face.a, face.b, face.c)
+            ]
+
+            if len(set(vertices)) < 3:
+                removed.append(
+                    (i, (face.a, face.b, face.c))
+                )
+            else:
+                changed.append(
+                    (i, obja.Face(*vertices))
+                )
+
+        return changed, removed
+
+    def evaluate_collapse(self, u, v, candidates):
+        if not self.is_valid_edge(u, v):
+            return None
+
+        changed, removed = self.prepare_collapse(u, v)
+
+        if not removed:
+            return None
+
+        for cost, position in candidates:
+            if self.check_geometry(u, v, position):
+                return cost, position, changed, removed
+
+        return None
+
+    def invalidate_local_edges(self, vertices):
+        edges = set()
+
+        for vertex in vertices:
+            for neighbor in self.neighbors[vertex]:
+                edges.add(
+                    (min(vertex, neighbor), max(vertex, neighbor))
+                )
+
+        for edge in edges:
+            self.edge_versions[edge] = (
+                self.edge_versions.get(edge, 0) + 1
+            )
+
+    def push_edge(self, u, v):
+        edge = (min(u, v), max(u, v))
+
+        if edge not in self.edge_faces:
+            return
+
+        candidates = self.get_candidate_positions(u, v)
+
+        if not candidates:
+            return
+
+        version = self.edge_versions.get(edge, 0) + 1
+        self.edge_versions[edge] = version
+
+        heapq.heappush(
+            self.heap,
+            (
+                candidates[0][0],
+                self.heap_counter,
+                u,
+                v,
+                version,
+                candidates
+            )
         )
 
-    def simplify2(self, target_ratio=0.1, max_cost=5.0):
-        initial_faces = self.count_visible_faces()
+        self.heap_counter += 1
+
+    def build_heap(self):
+        self.heap = []
+        self.edge_versions = {}
+        self.heap_counter = 0
+
+        for u, v in self.edge_faces:
+            self.push_edge(u, v)
+
+    def apply_collapse(self, u, v, position, changed, removed):
+        compact_changed = []
+
+        for i, _ in changed:
+            face = self.faces[i]
+            corner = (face.a, face.b, face.c).index(u)
+            compact_changed.append((i, corner))
+
+        compact_removed = []
+        removed_vertices = {}
+
+        for i, vertices in removed:
+            corner_u = vertices.index(u)
+            corner_v = vertices.index(v)
+            third = next(x for x in vertices if x != u and x != v)
+
+            compact_removed.append(
+                (i, vertices)
+            )
+
+            removed_vertices[third] = self.vertices[third].copy()
+
+        operation = {
+            "u": u,
+            "v": v,
+            "old_u_position": self.vertices[u].copy(),
+            "old_v_position": self.vertices[v].copy(),
+            "new_v_position": position.copy(),
+            "changed_faces": compact_changed,
+            "removed_faces": compact_removed,
+            "removed_vertices": removed_vertices
+        }
+
+        self.operations.append(operation)
+
+        self.vertices[v] = position.copy()
+        self.quadrics[v] += self.quadrics[u]
+
+        for i, face in changed:
+            self.faces[i] = face.clone()
+
+        for i, _ in removed:
+            self.active_faces[i] = False
+
+        return len(removed)
+
+    def simplify_progressively(self, target_ratio=0.5, max_collapses=None):
+        if not 0.0 < target_ratio <= 1.0:
+            raise ValueError(
+                "target_ratio doit être compris entre 0 et 1."
+            )
+
+        self.initialize()
+
+        initial_faces = sum(self.active_faces)
+
+        if initial_faces == 0:
+            raise ValueError(
+                "Le maillage ne contient aucune face active."
+            )
+
         target_faces = max(1, int(initial_faces * target_ratio))
+        current_faces = initial_faces
+        collapse_count = 0
 
-        heap = self.build_heap()
+        print("Faces initiales :", initial_faces)
+        print("Faces ciblées :", target_faces)
 
-        while self.count_visible_faces() > target_faces:
-            if not heap:
+        self.build_heap()
+
+        while current_faces > target_faces:
+            if (
+                max_collapses is not None
+                and collapse_count >= max_collapses
+            ):
                 break
 
-            cost, (vs, vt) = heapq.heappop(heap)
+            collapsed = False
 
-            if cost > max_cost:
+            while self.heap:
+                cost, _, u, v, version, candidates = heapq.heappop(
+                    self.heap
+                )
+
+                edge = (min(u, v), max(u, v))
+
+                if self.edge_versions.get(edge) != version:
+                    continue
+
+                if edge not in self.edge_faces:
+                    continue
+
+                result = self.evaluate_collapse(u, v, candidates)
+
+                if result is None:
+                    continue
+
+                cost, position, changed, removed = result
+
+                affected = (
+                    self.neighbors[u]
+                    | self.neighbors[v]
+                    | {u, v}
+                )
+
+                old_faces = [
+                    (i, self.faces[i].clone())
+                    for i in self.incident_faces[u]
+                ]
+
+                self.invalidate_local_edges(affected)
+
+                removed_count = self.apply_collapse(
+                    u, v, position, changed, removed
+                )
+
+                self.update_local_topology(old_faces, changed)
+
+                current_faces -= removed_count
+                collapse_count += 1
+                collapsed = True
+
+                updated_edges = set()
+
+                for vertex in affected:
+                    for neighbor in self.neighbors[vertex]:
+                        updated_edges.add(
+                            (min(vertex, neighbor), max(vertex, neighbor))
+                        )
+
+                for a, b in updated_edges:
+                    self.push_edge(a, b)
+
+                print(
+                    f"Collapse {collapse_count} : ({u}, {v}) "
+                    f"| Erreur = {cost:.6e} "
+                    f"| Faces = {current_faces}"
+                )
+
                 break
 
-            if not self.is_valid_edge(vs, vt):
-                continue
+            if not collapsed:
+                print("Aucune contraction valide restante.")
+                break
 
-            self.collapse_edge_improved(vs, vt, cost)
-            heap = self.build_heap()
+        print("\nSimplification terminée.")
+        print("Contractions :", collapse_count)
+        print("Faces restantes :", current_faces)
+        print(
+            f"Ratio final : {current_faces / initial_faces:.3f}"
+        )
 
-        print(f"Faces restantes : {self.count_visible_faces()} / {initial_faces}")
+    def write_progressive_mesh(self, output):
+        writer = obja.Output(output, random_color=True)
 
-    def count_visible_faces(self):
-        return sum(1 for face in self.faces if face.visible)
+        base_faces = [
+            i for i, active in enumerate(self.active_faces)
+            if active
+        ]
 
-    def write_obja_v2(self, output):
-        output_model = obja.Output(output, random_color=True)
-
-        # 1. Écriture du maillage de base (simplifié au maximum)
-        visible_faces = [face for face in self.faces if face.visible]
         used_vertices = set()
 
-        for face in visible_faces:
-            used_vertices.add(face.a)
-            used_vertices.add(face.b)
-            used_vertices.add(face.c)
+        for i in base_faces:
+            face = self.faces[i]
+            used_vertices.update(
+                (face.a, face.b, face.c)
+            )
 
-        # Sommets de la base
-        for v_id in sorted(used_vertices):
-            output_model.add_vertex(v_id, self.vertices[v_id])
+        for index in sorted(used_vertices):
+            writer.add_vertex(index, self.vertices[index])
 
-        # Faces de la base
-        face_counter = 0
-        for face in visible_faces:
-            output_model.add_face(face_counter, face)
-            face_counter += 1
+        for i in base_faces:
+            writer.add_face(i, self.faces[i])
 
-        # 2. Section maillage progressif (Inversion de l'historique)
-        output.write(f"# progressive_mesh {len(self.history)} collapses\n")
+        for operation in reversed(self.operations):
+            u = operation["u"]
+            v = operation["v"]
 
-        for collapse in reversed(self.history):
-            vt = collapse.target_vertex
-            vs = collapse.vertex_id
+            if u not in writer.vertex_mapping:
+                writer.add_vertex(
+                    u,
+                    operation["old_u_position"]
+                )
 
-            # S'assurer que le sommet cible (vt) existe dans le mapping avant de le modifier
-            if vt not in output_model.vertex_mapping:
-                output_model.add_vertex(vt, collapse.target_position)
-            else:
-                output_model.edit_vertex(vt, collapse.target_position)
+            if v not in writer.vertex_mapping:
+                writer.add_vertex(
+                    v,
+                    operation["new_v_position"]
+                )
 
-            # Restauration du sommet supprime (vs)
-            if vs not in output_model.vertex_mapping:
-                output_model.add_vertex(vs, collapse.vertex_position)
+            writer.edit_vertex(
+                v,
+                operation["old_v_position"]
+            )
 
-            # Restauration des faces
-            for face in collapse.faces:
-                # Vérification de sécurité pour les sommets de la face
-                for v_id in (face.a, face.b, face.c):
-                    if v_id not in output_model.vertex_mapping:
-                        output_model.add_vertex(v_id, self.vertices[v_id])
+            for i, corner in operation["changed_faces"]:
+                print(
+                    f"efv {writer.face_mapping[i] + 1} "
+                    f"{corner + 1} "
+                    f"{writer.vertex_mapping[u] + 1}",
+                    file=output
+                )
 
-                output_model.add_face(face_counter, face)
-                face_counter += 1
+            for i, vertices in operation["removed_faces"]:
+                for vertex in vertices:
+                    if vertex not in writer.vertex_mapping:
+                        if vertex == u:
+                            position = operation["old_u_position"]
+                        elif vertex == v:
+                            position = operation["old_v_position"]
+                        else:
+                            position = operation["removed_vertices"][vertex]
+
+                        writer.add_vertex(vertex, position)
+
+                writer.add_face(
+                    i,
+                    obja.Face(*vertices)
+                )
+
+        print("Fichier progressif écrit.")
 
 
 def main():
@@ -193,11 +625,19 @@ def main():
         output_file = "example/suzanne_pm.obja"
 
     model = ProgressiveMesh()
-    model.parse_file(input_file)
-    model.simplify2(target_ratio=0.1, max_cost=5.0)
 
-    with open(output_file, "w") as f:
-        model.write_obja_v2(f)
+    print("Chargement de", input_file)
+    model.parse_file(input_file)
+
+    print("Sommets :", len(model.vertices))
+    print("Faces :", len(model.faces))
+
+    model.simplify_progressively(target_ratio=0.13)
+
+    with open(output_file, "w") as output:
+        model.write_progressive_mesh(output)
+
+    print("Maillage progressif généré :", output_file)
 
 
 if __name__ == "__main__":
