@@ -10,6 +10,7 @@ import zlib
 import numpy as np
 
 import obja
+import comparaison
 
 
 class Collapse:
@@ -642,13 +643,19 @@ class ProgressiveMesh(obja.Model):
             "mean": float(np.mean(errors)) if len(errors) else 0.0,
             "maximum": float(np.max(errors)) if len(errors) else 0.0
         }
+
+
 def main(target_ratio=0.98):
     model = ProgressiveMesh()
     model.parse_file("example/suzanne.obj")
-    initial_faces = model.count_visible_faces()
     model.simplify(target_ratio=target_ratio)
     with open("example/suzanne_pm.obja", "w") as file:
         model.write_obja(file)
+    comparison = comparaison.compare_models(
+        obja.parse_file("example/suzanne.obj"),
+        model
+    )
+    comparaison.print_comparison(comparison)
     compressed_size = model.write_progressive_binary(
         "example/suzanne.pmz",
         bits=16
@@ -661,8 +668,6 @@ def main(target_ratio=0.98):
         restored.write_obja(file)
     split_result = restored.vertex_split()
 
-    print("Faces avant:", initial_faces)
-    print("Faces apres:", model.count_visible_faces())
     print("Collapses:", len(model.history))
     print("Fichier PMZ:", compressed_size, "octets")
     print("Faces relues:", restored_faces)
