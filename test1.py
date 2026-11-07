@@ -64,9 +64,7 @@ class ProgressiveMesh(obja.Model):
         self._heap = []
         self._heap_version = 0
 
-    # ------------------------------------------------------------------
     # Structures de voisinage et quadrics
-    # ------------------------------------------------------------------
     def _visible_face_vertices(self, face):
         return (face.a, face.b, face.c)
 
@@ -176,9 +174,7 @@ class ProgressiveMesh(obja.Model):
         _, cost = self._candidate_position(a, b)
         return cost
 
-    # ------------------------------------------------------------------
     # Validité géométrique et topologique
-    # ------------------------------------------------------------------
     def _link_condition(self, vs, vt):
         edge = tuple(sorted((vs, vt)))
         incident_faces = self.edge_faces.get(edge, set())
@@ -248,9 +244,7 @@ class ProgressiveMesh(obja.Model):
 
         return True
 
-    # ------------------------------------------------------------------
     # File de priorité et contraction
-    # ------------------------------------------------------------------
     def _build_priority_queue(self):
         self._heap_version += 1
         self._heap = []
@@ -322,9 +316,7 @@ class ProgressiveMesh(obja.Model):
         self.collect_edges()
         return True
 
-    # ------------------------------------------------------------------
     # Progressive mesh et vertex split
-    # ------------------------------------------------------------------
     def simplify(self, target_ratio=0.1):
         if not 0 < target_ratio <= 1:
             raise ValueError("target_ratio doit être compris entre 0 et 1.")
@@ -370,9 +362,7 @@ class ProgressiveMesh(obja.Model):
             self.vertex_split()
         return self
 
-    # ------------------------------------------------------------------
     # Export du maillage courant et de la séquence progressive
-    # ------------------------------------------------------------------
     def write_obja(self, output):
         """Écrit le niveau courant puis les opérations de reconstruction."""
         output_model = obja.Output(output, random_color=True)
