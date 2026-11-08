@@ -54,7 +54,7 @@ class ProgressiveMesh(obja.Model):
     Collapse peut être annulé par vertex_split(), dans l'ordre inverse.
     """
 
-    def __init__(self):
+    def __init__(self, lambda_spring=0.1, lambda_rep=0.01):
         super().__init__()
         self.history = []
         self.deleted_faces = set()
@@ -62,6 +62,8 @@ class ProgressiveMesh(obja.Model):
         self.vertex_neighbors = {}
         self.vertex_faces = {}
         self.vertex_quadrics = []
+        self.lambda_spring = float(lambda_spring)
+        self.lambda_rep = float(lambda_rep)
         self._heap = []
         self._heap_version = 0
 
@@ -138,8 +140,42 @@ class ProgressiveMesh(obja.Model):
             self.vertex_quadrics[b] += quadric
             self.vertex_quadrics[c] += quadric
 
+    def _qem_cost(self, a, b, position):
+        quadric = self.vertex_quadrics[a] + self.vertex_quadrics[b]
+        homogeneous = np.append(position, 1.0)
+        return max(0.0, float(homogeneous @ quadric @ homogeneous))
+
+    def _spring_energy(self, a, b, position):
+        """Calcule l'énergie ressort locale après la contraction."""
+        affected_neighbors = (
+            self.vertex_neighbors.get(a, set())
+            | self.vertex_neighbors.get(b, set())
+        )
+        energy = 0.0
+        counted_edges = set()
+        for neighbor in affected_neighbors:
+            if neighbor in (a, b):
+                continue
+            edge = tuple(sorted((b, neighbor)))
+            if edge in counted_edges:
+                continue
+            counted_edges.add(edge)
+            energy += float(np.sum((position - self.vertices[neighbor]) ** 2))
+        return energy
+
+    def _total_collapse_energy(self, a, b, position):
+        """Retourne E_total = E_QEM + lambda_spring E_spring + lambda_rep E_rep."""
+        qem_energy = self._qem_cost(a, b, position)
+        spring_energy = self._spring_energy(a, b, position)
+        representation_energy = 1.0
+        return (
+            qem_energy
+            + self.lambda_spring * spring_energy
+            + self.lambda_rep * representation_energy
+        )
+
     def _candidate_position(self, a, b):
-        """Calcule le minimum QEM, avec repli sûr sur les positions connues."""
+        """Calcule la position qui minimise l'énergie totale de Hoppe."""
         quadric = self.vertex_quadrics[a] + self.vertex_quadrics[b]
         system = quadric[:3, :3]
         rhs = -quadric[:3, 3]
@@ -158,8 +194,7 @@ class ProgressiveMesh(obja.Model):
         best_position = candidates[0]
         best_cost = float("inf")
         for position in candidates:
-            homogeneous = np.append(position, 1.0)
-            cost = float(homogeneous @ quadric @ homogeneous)
+            cost = self._total_collapse_energy(a, b, position)
             if np.isfinite(cost) and cost < best_cost:
                 best_position = position
                 best_cost = cost
@@ -167,7 +202,7 @@ class ProgressiveMesh(obja.Model):
         return np.asarray(best_position, dtype=float), max(0.0, best_cost)
 
     def edge_length(self, a, b):
-        """Retourne le coût quadratique de contraction QEM de (a, b)."""
+        """Retourne l'énergie totale de contraction de l'arête (a, b)."""
         if not self.vertex_quadrics:
             self._rebuild_quadrics()
         if (a, b) not in self.edge_faces and (b, a) not in self.edge_faces:
@@ -255,7 +290,7 @@ class ProgressiveMesh(obja.Model):
                 heapq.heappush(self._heap, (cost, edge, self._heap_version))
 
     def shortest_edge(self):
-        """Retourne l'arête valide de coût QEM minimal."""
+        """Retourne l'arête valide d'énergie totale minimale."""
         self._rebuild_quadrics()
         self._build_priority_queue()
         while self._heap:
@@ -563,7 +598,10 @@ class ProgressiveMesh(obja.Model):
             raise ValueError("Format progressive mesh invalide.")
         raw_size = struct.unpack(">Q", data[4:12])[0]
         checksum = data[12:44]
-        raw = zlib.decompress(data[44:])
+        try:
+            raw = zlib.decompress(data[44:])
+        except zlib.error as error:
+            raise ValueError("Données compressées invalides.") from error
         if len(raw) != raw_size or hashlib.sha256(raw).digest() != checksum:
             raise ValueError("Checksum ou taille du fichier invalide.")
         return json.loads(raw.decode("utf-8"))
