@@ -54,18 +54,24 @@ class ProgressiveMesh(obja.Model):
     Collapse peut être annulé par vertex_split(), dans l'ordre inverse.
     """
 
-    def __init__(self, lambda_spring=0.1, lambda_rep=0.01):
+    def __init__(self, lambda_spring=0.1, lambda_rep=0.01,
+                 lambda_disc=0.1):
         super().__init__()
         self.history = []
         self.deleted_faces = set()
         self.edge_faces = {}
         self.vertex_neighbors = {}
         self.vertex_faces = {}
-        self.vertex_quadrics = []
+        self.reference_vertices = None
         self.lambda_spring = float(lambda_spring)
         self.lambda_rep = float(lambda_rep)
+        self.lambda_disc = float(lambda_disc)
         self._heap = []
         self._heap_version = 0
+        self._distance_context = {}
+        self._pending_candidate = None
+        self._pending_edge = None
+        self._visible_face_count = None
 
     # Structures de voisinage et quadrics
     def _visible_face_vertices(self, face):
@@ -73,7 +79,10 @@ class ProgressiveMesh(obja.Model):
 
     def collect_edges(self):
         """Construit les incidences sommet-arête-face du maillage courant."""
+        if self.reference_vertices is None:
+            self.reference_vertices = np.asarray(self.vertices, dtype=float).copy()
         self.edge_faces = {}
+        self._distance_context = {}
         self.vertex_neighbors = {
             vertex_id: set() for vertex_id in range(len(self.vertices))
         }
@@ -113,37 +122,111 @@ class ProgressiveMesh(obja.Model):
             if self.faces[index].visible
         ]
 
-    def _rebuild_quadrics(self):
-        self.vertex_quadrics = [
-            np.zeros((4, 4), dtype=float)
-            for _ in self.vertices
-        ]
+    @staticmethod
+    def _point_triangle_distance_squared(point, first, second, third):
+        """Calcule la distance au carré entre un point et un triangle."""
+        edge_first = second - first
+        edge_second = third - first
+        offset = point - first
+        dot_first = np.dot(edge_first, offset)
+        dot_second = np.dot(edge_second, offset)
+        if dot_first <= 0 and dot_second <= 0:
+            return float(np.dot(offset, offset))
 
-        for face in self.faces:
-            if not face.visible:
-                continue
+        offset_second = point - second
+        dot_edge = np.dot(edge_first, offset_second)
+        dot_second_edge = np.dot(edge_second - edge_first, offset_second)
+        if dot_edge >= 0 and dot_second_edge <= dot_edge:
+            return float(np.dot(offset_second, offset_second))
 
-            a, b, c = self._visible_face_vertices(face)
-            p1, p2, p3 = self.vertices[a], self.vertices[b], self.vertices[c]
-            normal = np.cross(p2 - p1, p3 - p1)
-            norm = np.linalg.norm(normal)
-            if norm <= 1e-12:
-                continue
+        offset_third = point - third
+        edge_third = first - third
+        dot_third = np.dot(edge_third, offset_third)
+        dot_second_third = np.dot(edge_second - edge_third, offset_third)
+        if dot_third >= 0 and dot_second_third <= dot_third:
+            return float(np.dot(offset_third, offset_third))
 
-            normal /= norm
-            plane = np.array(
-                [normal[0], normal[1], normal[2], -np.dot(normal, p1)],
-                dtype=float
+        denominator = (
+            np.dot(edge_first, edge_first)
+            * np.dot(edge_second, edge_second)
+            - np.dot(edge_first, edge_second) ** 2
+        )
+        if denominator <= 1e-12:
+            return min(
+                np.dot(offset, offset),
+                np.dot(offset_second, offset_second),
+                np.dot(offset_third, offset_third)
             )
-            quadric = np.outer(plane, plane)
-            self.vertex_quadrics[a] += quadric
-            self.vertex_quadrics[b] += quadric
-            self.vertex_quadrics[c] += quadric
+        coordinate_first = (
+            np.dot(edge_first, edge_second) * dot_second
+            - np.dot(edge_second, edge_second) * dot_first
+        ) / denominator
+        coordinate_second = (
+            np.dot(edge_first, edge_second) * dot_first
+            - np.dot(edge_first, edge_first) * dot_second
+        ) / denominator
+        if coordinate_first >= 0 and coordinate_second >= 0:
+            if coordinate_first + coordinate_second <= 1:
+                projection = first + coordinate_first * edge_first + coordinate_second * edge_second
+                difference = point - projection
+                return float(np.dot(difference, difference))
 
-    def _qem_cost(self, a, b, position):
-        quadric = self.vertex_quadrics[a] + self.vertex_quadrics[b]
-        homogeneous = np.append(position, 1.0)
-        return max(0.0, float(homogeneous @ quadric @ homogeneous))
+        return min(
+            ProgressiveMesh._point_segment_distance_squared(point, first, second),
+            ProgressiveMesh._point_segment_distance_squared(point, second, third),
+            ProgressiveMesh._point_segment_distance_squared(point, third, first)
+        )
+
+    @staticmethod
+    def _point_segment_distance_squared(point, first, second):
+        direction = second - first
+        length_squared = np.dot(direction, direction)
+        if length_squared <= 1e-12:
+            difference = point - first
+            return float(np.dot(difference, difference))
+        parameter = np.clip(np.dot(point - first, direction) / length_squared, 0.0, 1.0)
+        difference = point - (first + parameter * direction)
+        return float(np.dot(difference, difference))
+
+    def _distance_energy(self, a, b, position):
+        """Approxime Edist par les points originaux des faces affectées."""
+        if self.reference_vertices is None:
+            self.reference_vertices = np.asarray(self.vertices, dtype=float).copy()
+        context = self._distance_context.get((a, b))
+        if context is None:
+            samples = set()
+            triangles = []
+            affected = self.vertex_faces.get(a, set()) | self.vertex_faces.get(b, set())
+            for face_index in affected:
+                face = self.faces[face_index]
+                if not face.visible:
+                    continue
+                original_vertices = self._visible_face_vertices(face)
+                vertices = tuple(
+                    b if vertex == a else vertex for vertex in original_vertices
+                )
+                if len(set(vertices)) < 3:
+                    continue
+                samples.update(original_vertices)
+                triangles.append(vertices)
+            context = (tuple(samples), tuple(triangles))
+            self._distance_context[(a, b)] = context
+        samples, triangles = context
+        if not triangles:
+            return float("inf")
+        return sum(
+            min(
+                self._point_triangle_distance_squared(
+                    self.reference_vertices[index],
+                    *(
+                        position if vertex == b else self.vertices[vertex]
+                        for vertex in triangle
+                    )
+                )
+                for triangle in triangles
+            )
+            for index in samples
+        )
 
     def _spring_energy(self, a, b, position):
         """Calcule l'énergie ressort locale après la contraction."""
@@ -163,33 +246,83 @@ class ProgressiveMesh(obja.Model):
             energy += float(np.sum((position - self.vertices[neighbor]) ** 2))
         return energy
 
+    def _discontinuity_energy(self, a, b, position):
+        """Préserve les arêtes de frontière pendant une contraction.
+
+        Les extrémités et le milieu des arêtes de frontière affectées sont
+        projetés sur les nouvelles arêtes de frontière. Une frontière qui
+        disparaît reçoit une pénalité infinie.
+        """
+        if self.reference_vertices is None:
+            self.reference_vertices = np.asarray(self.vertices, dtype=float).copy()
+
+        affected_vertices = {a, b}
+        affected_vertices.update(self.vertex_neighbors.get(a, set()))
+        affected_vertices.update(self.vertex_neighbors.get(b, set()))
+        boundary_edges = [
+            edge for edge, faces in self.edge_faces.items()
+            if len(faces) == 1 and set(edge) & affected_vertices
+        ]
+        if not boundary_edges:
+            return 0.0
+
+        def mapped_position(vertex):
+            if vertex == a or vertex == b:
+                return position
+            return self.vertices[vertex]
+
+        new_boundary_edges = set()
+        for edge in boundary_edges:
+            mapped_edge = tuple(sorted(
+                b if vertex == a else vertex
+                for vertex in edge
+            ))
+            if mapped_edge[0] != mapped_edge[1]:
+                new_boundary_edges.add(mapped_edge)
+
+        if not new_boundary_edges:
+            return float("inf")
+
+        energy = 0.0
+        for first, second in boundary_edges:
+            first_point = self.reference_vertices[first]
+            second_point = self.reference_vertices[second]
+            samples = (
+                first_point,
+                second_point,
+                (first_point + second_point) / 2.0
+            )
+            for sample in samples:
+                energy += min(
+                    self._point_segment_distance_squared(
+                        sample,
+                        mapped_position(edge_first),
+                        mapped_position(edge_second)
+                    )
+                    for edge_first, edge_second in new_boundary_edges
+                )
+        return float(energy)
+
     def _total_collapse_energy(self, a, b, position):
-        """Retourne E_total = E_QEM + lambda_spring E_spring + lambda_rep E_rep."""
-        qem_energy = self._qem_cost(a, b, position)
+        """Retourne l'énergie totale de contraction."""
+        distance_energy = self._distance_energy(a, b, position)
         spring_energy = self._spring_energy(a, b, position)
+        discontinuity_energy = self._discontinuity_energy(a, b, position)
         representation_energy = 1.0
         return (
-            qem_energy
+            distance_energy
             + self.lambda_spring * spring_energy
             + self.lambda_rep * representation_energy
+            + self.lambda_disc * discontinuity_energy
         )
 
     def _candidate_position(self, a, b):
         """Calcule la position qui minimise l'énergie totale de Hoppe."""
-        quadric = self.vertex_quadrics[a] + self.vertex_quadrics[b]
-        system = quadric[:3, :3]
-        rhs = -quadric[:3, 3]
-
         candidates = [
             self.vertices[a],
             self.vertices[b],
             (self.vertices[a] + self.vertices[b]) / 2.0
         ]
-        try:
-            if abs(np.linalg.det(system)) > 1e-12:
-                candidates.insert(0, np.linalg.solve(system, rhs))
-        except np.linalg.LinAlgError:
-            pass
 
         best_position = candidates[0]
         best_cost = float("inf")
@@ -203,8 +336,6 @@ class ProgressiveMesh(obja.Model):
 
     def edge_length(self, a, b):
         """Retourne l'énergie totale de contraction de l'arête (a, b)."""
-        if not self.vertex_quadrics:
-            self._rebuild_quadrics()
         if (a, b) not in self.edge_faces and (b, a) not in self.edge_faces:
             return float("inf")
         _, cost = self._candidate_position(a, b)
@@ -232,11 +363,25 @@ class ProgressiveMesh(obja.Model):
 
         return common_neighbors == opposite_vertices
 
+    def _boundary_vertices(self):
+        """Retourne les sommets appartenant à une arête de frontière."""
+        boundary_vertices = set()
+        for edge, faces in self.edge_faces.items():
+            if len(faces) == 1:
+                boundary_vertices.update(edge)
+        return boundary_vertices
+
     def is_valid_collapse(self, vs, vt, candidate=None):
         """Applique les contrôles de bord, manifold, link et retournement."""
         if vs == vt or not (0 <= vs < len(self.vertices)) or not (0 <= vt < len(self.vertices)):
             return False
-        if tuple(sorted((vs, vt))) not in self.edge_faces:
+        edge = tuple(sorted((vs, vt)))
+        if edge not in self.edge_faces:
+            return False
+        if len(self.edge_faces[edge]) == 1:
+            return False
+        boundary_vertices = self._boundary_vertices()
+        if (vs in boundary_vertices) != (vt in boundary_vertices):
             return False
         if not self._link_condition(vs, vt):
             return False
@@ -282,32 +427,47 @@ class ProgressiveMesh(obja.Model):
 
     # File de priorité et contraction
     def _build_priority_queue(self):
+        """Classe les arêtes avec une priorité géométrique peu coûteuse.
+
+        Le coût Hoppe complet reste calculé avant validation, mais uniquement
+        pour les arêtes sorties du tas au lieu de toutes les arêtes.
+        """
         self._heap_version += 1
         self._heap = []
+        self._pending_candidate = None
+        self._pending_edge = None
         for edge in self.collect_edges():
-            cost = self.edge_length(*edge)
-            if np.isfinite(cost):
-                heapq.heappush(self._heap, (cost, edge, self._heap_version))
+            first, second = (self.vertices[index] for index in edge)
+            priority = float(np.dot(first - second, first - second))
+            heapq.heappush(self._heap, (priority, edge, self._heap_version))
 
     def shortest_edge(self):
         """Retourne l'arête valide d'énergie totale minimale."""
-        self._rebuild_quadrics()
         self._build_priority_queue()
         while self._heap:
-            cost, edge, version = heapq.heappop(self._heap)
+            _, edge, version = heapq.heappop(self._heap)
             if version != self._heap_version:
                 continue
-            candidate, _ = self._candidate_position(*edge)
+            candidate, cost = self._candidate_position(*edge)
+            if not np.isfinite(cost):
+                continue
             if self.is_valid_collapse(*edge, candidate=candidate):
+                self._pending_edge = edge
+                self._pending_candidate = (candidate, cost)
                 return edge
         return None
 
     def collapse_edge(self, vs, vt):
         """Contracte vs vers vt et enregistre toutes les données du split."""
         self.collect_edges()
-        self._rebuild_quadrics()
-        candidate, cost = self._candidate_position(vs, vt)
+        edge = tuple(sorted((vs, vt)))
+        if self._pending_edge == edge and self._pending_candidate is not None:
+            candidate, cost = self._pending_candidate
+        else:
+            candidate, cost = self._candidate_position(vs, vt)
         if not self.is_valid_collapse(vs, vt, candidate=candidate):
+            self._pending_edge = None
+            self._pending_candidate = None
             return False
 
         removed_faces = []
@@ -332,6 +492,8 @@ class ProgressiveMesh(obja.Model):
                 removed_faces.append((face_index, old_face))
                 face.visible = False
                 self.deleted_faces.add(face_index)
+                if self._visible_face_count is not None:
+                    self._visible_face_count -= 1
                 continue
 
             face.a, face.b, face.c = new_vertices
@@ -350,6 +512,8 @@ class ProgressiveMesh(obja.Model):
             )
         )
         self.collect_edges()
+        self._pending_edge = None
+        self._pending_candidate = None
         return True
 
     # Progressive mesh et vertex split
@@ -382,13 +546,17 @@ class ProgressiveMesh(obja.Model):
             self.faces[face_index].copy(old_face)
             self.faces[face_index].visible = True
             self.deleted_faces.discard(face_index)
+            if self._visible_face_count is not None:
+                self._visible_face_count += 1
 
         self.history.pop()
         self.collect_edges()
         return True
 
     def count_visible_faces(self):
-        return sum(face.visible for face in self.faces)
+        if self._visible_face_count is None:
+            self._visible_face_count = sum(face.visible for face in self.faces)
+        return self._visible_face_count
 
     def get_level(self, number_of_splits):
         """Retourne le niveau obtenu après un nombre de vertex splits."""
@@ -683,26 +851,26 @@ class ProgressiveMesh(obja.Model):
         }
 
 
-def main(target_ratio=0.98):
+def main(target_ratio=0.125):
     model = ProgressiveMesh()
-    model.parse_file("example/suzanne.obj")
+    model.parse_file("example/bunny.obj")
     model.simplify(target_ratio=target_ratio)
-    with open("example/suzanne_pm.obja", "w") as file:
+    with open("example/bunny_pm.obja", "w") as file:
         model.write_obja(file)
     comparison = comparaison.compare_models(
-        obja.parse_file("example/suzanne.obj"),
+        obja.parse_file("example/bunny.obj"),
         model
     )
     comparaison.print_comparison(comparison)
     compressed_size = model.write_progressive_binary(
-        "example/suzanne.pmz",
+        "example/bunny.pmz",
         bits=16
     )
-
-    restored = ProgressiveMesh.read_progressive_binary("example/suzanne.pmz")
+    print("Taille du fichier compressé:", compressed_size, "octets")
+    restored = ProgressiveMesh.read_progressive_binary("example/bunny.pmz")
     restored_faces = restored.count_visible_faces()
     restored_collapses = len(restored.history)
-    with open("example/suzanne_decompressed.obja", "w") as file:
+    with open("example/bunny_decompressed.obja", "w") as file:
         restored.write_obja(file)
     split_result = restored.vertex_split()
 
