@@ -1,16 +1,68 @@
 #!/usr/bin/env python3
 
+import argparse
 import hashlib
 import heapq
 import json
+import math
+from pathlib import Path
 import struct
 import sys
+from time import perf_counter
 import zlib
 
 import numpy as np
 
 import obja
 import comparaison
+
+
+# ----------------------------------------------------------------------
+# Quadriques d'Erreur (Garland & Heckbert, SIGGRAPH 1997)
+# Représentation compacte symétrique 4x4 en 10 flottants
+# ----------------------------------------------------------------------
+def plane_to_quadric10(a: float, b: float, c: float, d: float, weight: float = 1.0) -> list[float]:
+    """Construit les 10 coefficients symétriques de la quadrique fondamentale weight * p p^T."""
+    return [
+        weight * a * a,
+        weight * a * b,
+        weight * a * c,
+        weight * a * d,
+        weight * b * b,
+        weight * b * c,
+        weight * b * d,
+        weight * c * c,
+        weight * c * d,
+        weight * d * d,
+    ]
+
+
+def eval_quadric10(q: list[float], x: float, y: float, z: float) -> float:
+    """Évalue v^T Q v via la formule développée de Garland (1997, §4 note 2)."""
+    val = (
+        q[0] * x * x
+        + 2.0 * q[1] * x * y
+        + 2.0 * q[2] * x * z
+        + 2.0 * q[3] * x
+        + q[4] * y * y
+        + 2.0 * q[5] * y * z
+        + 2.0 * q[6] * y
+        + q[7] * z * z
+        + 2.0 * q[8] * z
+        + q[9]
+    )
+    return val if val > 0.0 else 0.0
+
+
+def add_quadric10_inplace(dst: list[float], src: list[float]) -> None:
+    """Accumule dst += src sur les 10 coefficients symétriques."""
+    for i in range(10):
+        dst[i] += src[i]
+
+
+def sum_quadric10(q1: list[float], q2: list[float]) -> list[float]:
+    """Retourne q1 + q2 sous forme de liste de 10 flottants."""
+    return [q1[i] + q2[i] for i in range(10)]
 
 
 class Collapse:
@@ -54,8 +106,15 @@ class ProgressiveMesh(obja.Model):
     Collapse peut être annulé par vertex_split(), dans l'ordre inverse.
     """
 
-    def __init__(self, lambda_spring=0.1, lambda_rep=0.01,
-                 lambda_disc=0.1):
+    def __init__(
+        self,
+        use_qem=True,
+        boundary_weight=10.0,
+        saliency_weight=0.0,
+        lambda_spring=0.1,
+        lambda_rep=0.01,
+        lambda_disc=0.1,
+    ):
         super().__init__()
         self.history = []
         self.deleted_faces = set()
@@ -66,6 +125,11 @@ class ProgressiveMesh(obja.Model):
         self.lambda_spring = float(lambda_spring)
         self.lambda_rep = float(lambda_rep)
         self.lambda_disc = float(lambda_disc)
+        self.use_qem = bool(use_qem)
+        self.boundary_weight = float(boundary_weight)
+        self.saliency_weight = float(saliency_weight)
+        self.vertex_saliency = None  # Point d'ancrage pour le collègue (Saillance LCE)
+        self.quadrics10 = []
         self._heap = []
         self._heap_version = 0
         self._distance_context = {}
@@ -73,7 +137,77 @@ class ProgressiveMesh(obja.Model):
         self._pending_edge = None
         self._visible_face_count = None
 
-    # Structures de voisinage et quadrics
+    # ------------------------------------------------------------------
+    # Structures de voisinage et Quadrics (Garland & Heckbert 1997)
+    # ------------------------------------------------------------------
+    def compute_initial_quadrics(self):
+        """Initialise les quadriques 10-float par sommet selon Garland & Heckbert (1997)."""
+        num_v = len(self.vertices)
+        self.quadrics10 = [[0.0] * 10 for _ in range(num_v)]
+
+        # 1. Quadriques des faces (pondérées par l'aire du triangle)
+        for face in self.faces:
+            if not face.visible:
+                continue
+            p0 = self.vertices[face.a]
+            p1 = self.vertices[face.b]
+            p2 = self.vertices[face.c]
+            normal = np.cross(p1 - p0, p2 - p0)
+            norm = float(np.linalg.norm(normal))
+            if norm <= 1e-12:
+                continue
+            normal /= norm
+            area = 0.5 * norm
+            d = -float(np.dot(normal, p0))
+            kq = plane_to_quadric10(normal[0], normal[1], normal[2], d, weight=area)
+            add_quadric10_inplace(self.quadrics10[face.a], kq)
+            add_quadric10_inplace(self.quadrics10[face.b], kq)
+            add_quadric10_inplace(self.quadrics10[face.c], kq)
+
+        # 2. Plans de contrainte perpendiculaires sur les bords (Garland §6)
+        if self.boundary_weight > 0.0:
+            for edge, faces in self.edge_faces.items():
+                if len(faces) == 1:
+                    u, w = edge
+                    pu, pw = self.vertices[u], self.vertices[w]
+                    edge_vec = pw - pu
+                    edge_len = float(np.linalg.norm(edge_vec))
+                    if edge_len <= 1e-12:
+                        continue
+                    face_idx = next(iter(faces))
+                    f = self.faces[face_idx]
+                    fn = np.cross(self.vertices[f.b] - self.vertices[f.a], self.vertices[f.c] - self.vertices[f.a])
+                    fn_norm = float(np.linalg.norm(fn))
+                    if fn_norm <= 1e-12:
+                        continue
+                    fn /= fn_norm
+                    # Plan perpendiculaire à la face passant par l'arête de bord
+                    perp = np.cross(edge_vec, fn)
+                    perp_norm = float(np.linalg.norm(perp))
+                    if perp_norm <= 1e-12:
+                        continue
+                    perp /= perp_norm
+                    d_perp = -float(np.dot(perp, pu))
+                    kq_bnd = plane_to_quadric10(perp[0], perp[1], perp[2], d_perp, weight=self.boundary_weight * edge_len)
+                    add_quadric10_inplace(self.quadrics10[u], kq_bnd)
+                    add_quadric10_inplace(self.quadrics10[w], kq_bnd)
+
+    def qem_cost(self, a, b, position):
+        """Évalue l'erreur quadrique QEM (Garland 1997) + hook saillance pour le collègue."""
+        if not self.quadrics10 or len(self.quadrics10) != len(self.vertices):
+            self.compute_initial_quadrics()
+        q_sum = sum_quadric10(self.quadrics10[a], self.quadrics10[b])
+        cost = eval_quadric10(q_sum, float(position[0]), float(position[1]), float(position[2]))
+
+        # Hook pour la saillance (Papier 3 - Limper 2016)
+        if self.saliency_weight > 0.0 and self.vertex_saliency is not None:
+            sal_a = self.vertex_saliency[a] if a < len(self.vertex_saliency) else 0.0
+            sal_b = self.vertex_saliency[b] if b < len(self.vertex_saliency) else 0.0
+            sal_edge = 0.5 * (sal_a + sal_b)
+            cost *= (1.0 + self.saliency_weight * sal_edge)
+
+        return cost
+
     def _visible_face_vertices(self, face):
         return (face.a, face.b, face.c)
 
@@ -317,7 +451,7 @@ class ProgressiveMesh(obja.Model):
         )
 
     def _candidate_position(self, a, b):
-        """Calcule la position qui minimise l'énergie totale de Hoppe."""
+        """Calcule la position qui minimise l'erreur (QEM Garland 1997 ou Énergie Hoppe 1996)."""
         candidates = [
             self.vertices[a],
             self.vertices[b],
@@ -327,7 +461,11 @@ class ProgressiveMesh(obja.Model):
         best_position = candidates[0]
         best_cost = float("inf")
         for position in candidates:
-            cost = self._total_collapse_energy(a, b, position)
+            if self.use_qem:
+                cost = self.qem_cost(a, b, position)
+            else:
+                cost = self._total_collapse_energy(a, b, position)
+
             if np.isfinite(cost) and cost < best_cost:
                 best_position = position
                 best_cost = cost
@@ -363,13 +501,14 @@ class ProgressiveMesh(obja.Model):
 
         return common_neighbors == opposite_vertices
 
-    def _boundary_vertices(self):
-        """Retourne les sommets appartenant à une arête de frontière."""
-        boundary_vertices = set()
-        for edge, faces in self.edge_faces.items():
-            if len(faces) == 1:
-                boundary_vertices.update(edge)
-        return boundary_vertices
+    def _is_boundary_vertex(self, v):
+        """Vérifie si le sommet v appartient à au moins une arête de bord (1 seule face incidente)."""
+        for nbr in self.vertex_neighbors.get(v, ()):
+            edge = (v, nbr) if v < nbr else (nbr, v)
+            faces = self.edge_faces.get(edge)
+            if faces is not None and len(faces) == 1:
+                return True
+        return False
 
     def is_valid_collapse(self, vs, vt, candidate=None):
         """Applique les contrôles de bord, manifold, link et retournement."""
@@ -380,8 +519,7 @@ class ProgressiveMesh(obja.Model):
             return False
         if len(self.edge_faces[edge]) == 1:
             return False
-        boundary_vertices = self._boundary_vertices()
-        if (vs in boundary_vertices) != (vt in boundary_vertices):
+        if self._is_boundary_vertex(vs) != self._is_boundary_vertex(vt):
             return False
         if not self._link_condition(vs, vt):
             return False
@@ -427,26 +565,45 @@ class ProgressiveMesh(obja.Model):
 
     # File de priorité et contraction
     def _build_priority_queue(self):
-        """Classe les arêtes avec une priorité géométrique peu coûteuse.
-
-        Le coût Hoppe complet reste calculé avant validation, mais uniquement
-        pour les arêtes sorties du tas au lieu de toutes les arêtes.
-        """
+        """Classe les arêtes par coût (QEM Garland 1997 ou longueur)."""
         self._heap_version += 1
         self._heap = []
         self._pending_candidate = None
         self._pending_edge = None
-        for edge in self.collect_edges():
-            first, second = (self.vertices[index] for index in edge)
-            priority = float(np.dot(first - second, first - second))
-            heapq.heappush(self._heap, (priority, edge, self._heap_version))
+        if self.use_qem:
+            if not self.quadrics10:
+                self.compute_initial_quadrics()
+            for edge in self.collect_edges():
+                candidate, cost = self._candidate_position(*edge)
+                heapq.heappush(self._heap, (cost, edge, self._heap_version))
+        else:
+            for edge in self.collect_edges():
+                first, second = (self.vertices[index] for index in edge)
+                priority = float(np.dot(first - second, first - second))
+                heapq.heappush(self._heap, (priority, edge, self._heap_version))
 
     def shortest_edge(self):
-        """Retourne l'arête valide d'énergie totale minimale."""
-        self._build_priority_queue()
+        """Retourne l'arête valide d'énergie/erreur minimale."""
+        if not self._heap:
+            self._build_priority_queue()
         while self._heap:
             _, edge, version = heapq.heappop(self._heap)
             if version != self._heap_version:
+                continue
+            if edge not in self.edge_faces:
+                continue
+            candidate, cost = self._candidate_position(*edge)
+            if not np.isfinite(cost):
+                continue
+            if self.is_valid_collapse(*edge, candidate=candidate):
+                self._pending_edge = edge
+                self._pending_candidate = (candidate, cost)
+                return edge
+        # Si le tas est épuisé, reconstruire une fois
+        self._build_priority_queue()
+        while self._heap:
+            _, edge, version = heapq.heappop(self._heap)
+            if version != self._heap_version or edge not in self.edge_faces:
                 continue
             candidate, cost = self._candidate_position(*edge)
             if not np.isfinite(cost):
@@ -458,9 +615,8 @@ class ProgressiveMesh(obja.Model):
         return None
 
     def collapse_edge(self, vs, vt):
-        """Contracte vs vers vt et enregistre toutes les données du split."""
-        self.collect_edges()
-        edge = tuple(sorted((vs, vt)))
+        """Contracte vs vers vt et enregistre toutes les données du split (mise à jour topologique locale O(1))."""
+        edge = (vs, vt) if vs < vt else (vt, vs)
         if self._pending_edge == edge and self._pending_candidate is not None:
             candidate, cost = self._pending_candidate
         else:
@@ -473,6 +629,12 @@ class ProgressiveMesh(obja.Model):
         removed_faces = []
         modified_faces = []
         target_position = np.copy(self.vertices[vt])
+
+        # Voisins affectés pour mise à jour locale de vertex_neighbors
+        affected_nbrs = {vs, vt}
+        affected_nbrs.update(self.vertex_neighbors.get(vs, ()))
+        affected_nbrs.update(self.vertex_neighbors.get(vt, ()))
+
         affected = sorted(
             self.vertex_faces.get(vs, set())
             | self.vertex_faces.get(vt, set())
@@ -484,22 +646,74 @@ class ProgressiveMesh(obja.Model):
                 continue
 
             old_face = face.clone()
+            old_verts = self._visible_face_vertices(face)
             new_vertices = [
                 vt if vertex == vs else vertex
-                for vertex in self._visible_face_vertices(face)
+                for vertex in old_verts
             ]
             if len(set(new_vertices)) < 3:
+                # 1. Face dégénérée : elle est supprimée
                 removed_faces.append((face_index, old_face))
                 face.visible = False
                 self.deleted_faces.add(face_index)
                 if self._visible_face_count is not None:
                     self._visible_face_count -= 1
+
+                # Détacher cette face de ses sommets et arêtes
+                for v in old_verts:
+                    if v in self.vertex_faces:
+                        self.vertex_faces[v].discard(face_index)
+                for i in range(3):
+                    u, w = old_verts[i], old_verts[(i + 1) % 3]
+                    e = (u, w) if u < w else (w, u)
+                    ef = self.edge_faces.get(e)
+                    if ef is not None:
+                        ef.discard(face_index)
+                        if not ef:
+                            del self.edge_faces[e]
                 continue
 
+            # 2. Face modifiée : vs est remplacé par vt
             face.a, face.b, face.c = new_vertices
             modified_faces.append((face_index, old_face, face.clone()))
 
+            # Mettre à jour l'incidence sommet-face
+            if vs in self.vertex_faces:
+                self.vertex_faces[vs].discard(face_index)
+            self.vertex_faces.setdefault(vt, set()).add(face_index)
+
+            # Mettre à jour les arêtes qui contenaient vs
+            for i in range(3):
+                u_old, w_old = old_verts[i], old_verts[(i + 1) % 3]
+                u_new, w_new = new_vertices[i], new_vertices[(i + 1) % 3]
+                if (u_old, w_old) != (u_new, w_new):
+                    e_old = (u_old, w_old) if u_old < w_old else (w_old, u_old)
+                    ef = self.edge_faces.get(e_old)
+                    if ef is not None:
+                        ef.discard(face_index)
+                        if not ef:
+                            del self.edge_faces[e_old]
+                    e_new = (u_new, w_new) if u_new < w_new else (w_new, u_new)
+                    self.edge_faces.setdefault(e_new, set()).add(face_index)
+
+        # Mettre à jour vertex_neighbors localement pour les sommets affectés
+        self.vertex_neighbors[vs] = set()
+        for u in affected_nbrs:
+            if u == vs:
+                continue
+            nbrs = set()
+            for fid in self.vertex_faces.get(u, ()):
+                f = self.faces[fid]
+                for v in (f.a, f.b, f.c):
+                    if v != u:
+                        nbrs.add(v)
+            self.vertex_neighbors[u] = nbrs
+
         self.vertices[vt] = candidate
+        if self.use_qem and self.quadrics10:
+            add_quadric10_inplace(self.quadrics10[vt], self.quadrics10[vs])
+            self.quadrics10[vs] = [0.0] * 10
+
         self.history.append(
             Collapse(
                 vs,
@@ -511,7 +725,14 @@ class ProgressiveMesh(obja.Model):
                 cost
             )
         )
-        self.collect_edges()
+
+        if self.use_qem and self._heap:
+            for neighbor in self.vertex_neighbors.get(vt, ()):
+                nbr_edge = (vt, neighbor) if vt < neighbor else (neighbor, vt)
+                if nbr_edge in self.edge_faces:
+                    nbr_cand, nbr_cost = self._candidate_position(*nbr_edge)
+                    heapq.heappush(self._heap, (nbr_cost, nbr_edge, self._heap_version))
+
         self._pending_edge = None
         self._pending_candidate = None
         return True
@@ -521,8 +742,18 @@ class ProgressiveMesh(obja.Model):
         if not 0 < target_ratio <= 1:
             raise ValueError("target_ratio doit être compris entre 0 et 1.")
 
+        self.collect_edges()
+        if self.use_qem and not self.quadrics10:
+            self.compute_initial_quadrics()
+
+        # Hook automatique pour la saillance (Limper 2016)
+        if self.saliency_weight > 0.0 and self.vertex_saliency is None and hasattr(self, "compute_saliency"):
+            self.compute_saliency()
+
         initial_faces = self.count_visible_faces()
         target_faces = max(1, int(initial_faces * target_ratio))
+        self._build_priority_queue()
+
         while self.count_visible_faces() > target_faces:
             edge = self.shortest_edge()
             if edge is None or not self.collapse_edge(*edge):
@@ -569,7 +800,7 @@ class ProgressiveMesh(obja.Model):
     # Export du maillage courant et de la séquence progressive
     def write_obja(self, output):
         """Écrit le niveau courant puis les opérations de reconstruction."""
-        output_model = obja.Output(output, random_color=True)
+        output_model = obja.Output(output, random_color=False)
 
         def ensure_vertex(vertex_id, position=None):
             if vertex_id not in output_model.vertex_mapping:
@@ -851,37 +1082,110 @@ class ProgressiveMesh(obja.Model):
         }
 
 
-def main(target_ratio=0.125):
-    model = ProgressiveMesh()
-    model.parse_file("example/bunny.obj")
-    model.simplify(target_ratio=target_ratio)
-    with open("example/bunny_pm.obja", "w") as file:
-        model.write_obja(file)
-    comparison = comparaison.compare_models(
-        obja.parse_file("example/bunny.obj"),
-        model
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Progressive Mesh avec Quadric Error Metrics (Garland & Heckbert 1997)."
     )
-    comparaison.print_comparison(comparison)
-    compressed_size = model.write_progressive_binary(
-        "example/bunny.pmz",
-        bits=16
-    )
-    print("Taille du fichier compressé:", compressed_size, "octets")
-    restored = ProgressiveMesh.read_progressive_binary("example/bunny.pmz")
-    restored_faces = restored.count_visible_faces()
-    restored_collapses = len(restored.history)
-    with open("example/bunny_decompressed.obja", "w") as file:
-        restored.write_obja(file)
-    split_result = restored.vertex_split()
+    parser.add_argument("model", nargs="?", default="example/bunny.obj", help="Chemin vers le modèle OBJ (défaut: example/bunny.obj)")
+    parser.add_argument("--ratio", type=float, default=0.1, help="Ratio de faces cibles (ex: 0.1 pour 10%%)")
+    parser.add_argument("--method", choices=["qem", "hoppe"], default="qem", help="Méthode de coût d'erreur (qem ou hoppe)")
+    parser.add_argument("--boundary-weight", type=float, default=10.0, help="Poids des plans de contrainte de bord (Garland §6)")
+    parser.add_argument("--saliency-weight", type=float, default=0.0, help="Poids de la saillance (hook prêt pour papier 3)")
+    parser.add_argument("--bits", type=int, default=16, help="Bits de quantification pour le binaire PMZ (défaut: 16)")
+    parser.add_argument("--output-obja", type=str, default=None, help="Chemin de sortie OBJA personnalisé")
+    parser.add_argument("--output-pmz", type=str, default=None, help="Chemin de sortie PMZ personnalisé")
+    args = parser.parse_args(argv)
 
-    print("Collapses:", len(model.history))
-    print("Fichier PMZ:", compressed_size, "octets")
-    print("Faces relues:", restored_faces)
-    print("Collapses relus:", restored_collapses)
-    print("Vertex split:", split_result)
-    print("Faces apres split:", restored.count_visible_faces())
+    model_path = Path(args.model)
+    if not model_path.is_file():
+        alt = Path("example") / model_path.name
+        if not alt.suffix:
+            alt = alt.with_suffix(".obj")
+        if alt.is_file():
+            model_path = alt
+        else:
+            raise FileNotFoundError(f"Impossible de trouver le modèle : {args.model}")
+
+    print("=" * 70)
+    print(f"  PROGRESSIVE MESH — {'QEM (Garland & Heckbert 1997)' if args.method == 'qem' else 'Énergie Hoppe 1996'}")
+    print("=" * 70)
+    print(f"Modèle d'entrée    : {model_path.name}")
+    print(f"Méthode choisie    : {args.method.upper()}")
+    print(f"Ratio cible        : {args.ratio:.1%}")
+
+    # 1. Chargement du modèle
+    model = ProgressiveMesh(
+        use_qem=(args.method == "qem"),
+        boundary_weight=args.boundary_weight,
+        saliency_weight=args.saliency_weight,
+    )
+    t0_load = perf_counter()
+    model.parse_file(str(model_path))
+    t_load = perf_counter() - t0_load
+
+    initial_vertices = len(model.vertices)
+    initial_faces = model.count_visible_faces()
+    print(f"\n[1] Maillage initial chargé en {t_load:.4f}s :")
+    print(f"    - Sommets : {initial_vertices}")
+    print(f"    - Faces   : {initial_faces}")
+
+    # 2. Simplification progressive
+    print(f"\n[2] Simplification progressive en cours ({args.method.upper()})...")
+    t0_sim = perf_counter()
+    model.simplify(target_ratio=args.ratio)
+    t_sim = perf_counter() - t0_sim
+
+    final_faces = model.count_visible_faces()
+    num_collapses = len(model.history)
+    rate = num_collapses / max(1e-6, t_sim)
+    print(f"    - Terminé en {t_sim:.4f}s ({rate:.0f} collapses/sec) !")
+    print(f"    - Faces finales : {initial_faces} -> {final_faces} ({final_faces / initial_faces:.1%})")
+    print(f"    - Vertex splits enregistrés : {num_collapses}")
+
+    # 3. Export OBJA
+    stem = f"{model_path.stem}_{args.method}_r{args.ratio:g}"
+    obja_path = Path(args.output_obja) if args.output_obja else Path("example") / f"{stem}.obja"
+    obja_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(obja_path, "w", encoding="utf-8") as file:
+        model.write_obja(file)
+    obja_bytes = obja_path.stat().st_size
+    print(f"\n[3] Export OBJA progressif :")
+    print(f"    - Fichier OBJA : {obja_path.name} ({obja_bytes:,} octets, {obja_bytes / 1024:.1f} Ko)")
+
+    # 4. Quantification et compression binaire PMZ
+    pmz_path = Path(args.output_pmz) if args.output_pmz else Path("example") / f"{stem}.pmz"
+    pmz_bytes = model.write_progressive_binary(str(pmz_path), bits=args.bits)
+    orig_bytes = model_path.stat().st_size
+    ratio_comp = pmz_bytes / orig_bytes if orig_bytes > 0 else 0.0
+    gain = orig_bytes / max(1, pmz_bytes)
+    print(f"\n[4] Quantification ({args.bits} bits) et Compression Binaire PMZ :")
+    print(f"    - Fichier PMZ compressé (zlib) : {pmz_path.name} ({pmz_bytes:,} octets, {pmz_bytes / 1024:.1f} Ko)")
+    print(f"    - Taux de compression vs OBJ original : {ratio_comp:.1%} (taille divisée par {gain:.1f}x)")
+
+    # 5. Validation et test de réversibilité
+    restored = ProgressiveMesh.read_progressive_binary(str(pmz_path))
+    num_restored = len(restored.history)
+    exact_splits = num_restored == num_collapses
+    split_ok = restored.vertex_split()
+    print(f"\n[5] Test de relecture et décodage du PMZ :")
+    print(f"    - Collapses relus avec succès : {num_restored} / {num_collapses} ({'OK' if exact_splits else 'ERREUR'})")
+    print(f"    - Test d'un vertex split réversible : {'SUCCÈS' if split_ok else 'ÉCHEC'}")
+
+    # 6. Métriques de comparaison géométrique vs original
+    try:
+        comp = comparaison.compare_files(str(model_path), str(obja_path))
+        print(f"\n[6] Métriques d'erreur géométrique vs original (Hausdorff & Moyenne) :")
+        print(f"    - Sommets restants               : {comp['original_vertices']} -> {comp['final_vertices']} (-{comp['vertex_reduction_percent']:.1f}%)")
+        print(f"    - Faces restantes                : {comp['original_faces']} -> {comp['final_faces']} (-{comp['face_reduction_percent']:.1f}%)")
+        print(f"    - Erreur géométrique moyenne     : {comp['mean_geometric_error']:.6f}")
+        print(f"    - Erreur géométrique maximale    : {comp['maximum_geometric_error']:.6f} (Hausdorff)")
+        print(f"    - Erreur moyenne normalisée      : {comp['normalized_mean_error_percent']:.4f}% de la diagonale")
+        print(f"    - Erreur maximale normalisée     : {comp['normalized_maximum_error_percent']:.4f}% de la diagonale")
+    except Exception as e:
+        print(f"\n[6] Erreur lors du calcul comparatif : {e}")
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":
-    ratio = float(sys.argv[1]) if len(sys.argv) > 1 else 0.98
-    main(target_ratio=ratio)
+    main()
