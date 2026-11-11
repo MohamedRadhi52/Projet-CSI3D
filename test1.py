@@ -15,6 +15,7 @@ import numpy as np
 
 import obja
 import comparaison
+import saillance
 
 
 # ----------------------------------------------------------------------
@@ -747,8 +748,9 @@ class ProgressiveMesh(obja.Model):
             self.compute_initial_quadrics()
 
         # Hook automatique pour la saillance (Limper 2016)
-        if self.saliency_weight > 0.0 and self.vertex_saliency is None and hasattr(self, "compute_saliency"):
-            self.compute_saliency()
+        if self.saliency_weight > 0.0 and self.vertex_saliency is None:
+            print("    - Calcul de la saillance de surface (Limper 2016)...")
+            self.vertex_saliency = saillance.calculer_saillance(self)
 
         initial_faces = self.count_visible_faces()
         target_faces = max(1, int(initial_faces * target_ratio))
