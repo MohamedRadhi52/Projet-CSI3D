@@ -15,6 +15,9 @@ import saillance
 import qem
 
 
+# ======================================================================
+# [STRUCTURE PROGRESSIVE MESH] Enregistrement d'un Edge Collapse inversible
+# ======================================================================
 class Collapse:
     """Un enregistrement de contraction, inversable par vertex split."""
 
@@ -87,28 +90,31 @@ class ProgressiveMesh(obja.Model):
         self._pending_edge = None
         self._visible_face_count = None
 
-    # ------------------------------------------------------------------
-    # Structures Quadrics QEM (Garland & Heckbert 1997 via qem.py)
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # [QEM] Quadriques d'Erreur (Garland & Heckbert 1997 via qem.py)
+    # ==================================================================
     def compute_initial_quadrics(self):
-        """Initialise les quadriques 10-float via le module qem (Garland & Heckbert 1997)."""
+        """[QEM] Initialise les quadriques 10-float via le module qem."""
         self.quadrics10 = qem.compute_initial_quadrics(
             self.vertices, self.faces, self.edge_faces, self.boundary_weight
         )
 
     def qem_cost(self, a, b, position):
-        """Évalue l'erreur quadrique QEM (Garland 1997) + saillance facultative."""
+        """[QEM] Évalue l'erreur quadrique QEM + saillance facultative via qem.py."""
         if not self.quadrics10 or len(self.quadrics10) != len(self.vertices):
             self.compute_initial_quadrics()
         return qem.eval_edge_cost(
             self.quadrics10, a, b, position, self.saliency_weight, self.vertex_saliency
         )
 
+    # ==================================================================
+    # [STRUCTURE COMMUNE & TOPOLOGIE] Incidences arêtes - faces - sommets
+    # ==================================================================
     def _visible_face_vertices(self, face):
         return (face.a, face.b, face.c)
 
     def collect_edges(self):
-        """Construit les incidences sommet-arête-face du maillage courant."""
+        """[STRUCTURE] Construit les incidences sommet-arête-face du maillage courant."""
         if self.reference_vertices is None:
             self.reference_vertices = np.asarray(self.vertices, dtype=float).copy()
         self.edge_faces = {}
@@ -144,7 +150,7 @@ class ProgressiveMesh(obja.Model):
         return list(self.edge_faces)
 
     def collect_edge_neighborhood(self, a, b):
-        """Retourne les faces incidentes à a ou b sans cloner le maillage."""
+        """[STRUCTURE] Retourne les faces incidentes à a ou b sans cloner le maillage."""
         face_indices = self.vertex_faces.get(a, set()) | self.vertex_faces.get(b, set())
         return [
             self.faces[index].clone()
@@ -152,9 +158,13 @@ class ProgressiveMesh(obja.Model):
             if self.faces[index].visible
         ]
 
+    # ==================================================================
+    # [HOPPE] Calculs d'Énergie originaux (Hoppe SIGGRAPH 1996)
+    # E_total = E_dist + lambda_spring * E_spring + lambda_disc * E_disc
+    # ==================================================================
     @staticmethod
     def _point_triangle_distance_squared(point, first, second, third):
-        """Calcule la distance au carré entre un point et un triangle."""
+        """[HOPPE] Calcule la distance au carré entre un point et un triangle."""
         edge_first = second - first
         edge_second = third - first
         offset = point - first
@@ -333,8 +343,9 @@ class ProgressiveMesh(obja.Model):
                 )
         return float(energy)
 
+    # [HOPPE] Énergie totale de contraction : E = Edist + lambda_spring * Espring + lambda_disc * Edisc
     def _total_collapse_energy(self, a, b, position):
-        """Retourne l'énergie totale de contraction."""
+        """[HOPPE] Retourne l'énergie totale de contraction."""
         distance_energy = self._distance_energy(a, b, position)
         spring_energy = self._spring_energy(a, b, position)
         discontinuity_energy = self._discontinuity_energy(a, b, position)
@@ -346,16 +357,20 @@ class ProgressiveMesh(obja.Model):
             + self.lambda_disc * discontinuity_energy
         )
 
+    # ==================================================================
+    # [HYBRIDE QEM / HOPPE] Sélection de la position optimale du sommet contracté
+    # ==================================================================
     def _candidate_position(self, a, b):
-        """Calcule la position optimale : QEM (Garland 1997 via qem.py) ou Énergie originale (Hoppe 1996)."""
+        """[HYBRIDE] Calcule la position optimale : QEM (Garland 1997 via qem.py) ou Énergie originale (Hoppe 1996)."""
         if self.use_qem:
+            # Branche QEM (avec hook saillance Limper 2016 facultatif)
             if not self.quadrics10:
                 self.compute_initial_quadrics()
             return qem.optimal_candidate_position(
                 self.quadrics10, self.vertices, a, b, self.saliency_weight, self.vertex_saliency
             )
 
-        # Méthode originale de Hoppe (1996) basée sur l'énergie totale (distance + ressort + discontinuité)
+        # Branche HOPPE originale (1996) basée sur l'énergie totale (distance + ressort + discontinuité)
         candidates = [
             self.vertices[a],
             self.vertices[b],
@@ -371,14 +386,17 @@ class ProgressiveMesh(obja.Model):
         return np.asarray(best_position, dtype=float), max(0.0, best_cost)
 
     def edge_length(self, a, b):
-        """Retourne l'énergie totale de contraction de l'arête (a, b)."""
+        """[HOPPE] Retourne l'énergie totale de contraction de l'arête (a, b)."""
         if (a, b) not in self.edge_faces and (b, a) not in self.edge_faces:
             return float("inf")
         _, cost = self._candidate_position(a, b)
         return cost
 
-    # Validité géométrique et topologique
+    # ==================================================================
+    # [VALIDITÉ TOPOLOGIQUE & GÉOMÉTRIQUE] Link condition, frontières et normales
+    # ==================================================================
     def _link_condition(self, vs, vt):
+        """[TOPOLOGIE] Vérifie la condition de lien pour garantir que le maillage reste 2-manifold."""
         edge = tuple(sorted((vs, vt)))
         incident_faces = self.edge_faces.get(edge, set())
         if not incident_faces or len(incident_faces) > 2:
@@ -400,7 +418,7 @@ class ProgressiveMesh(obja.Model):
         return common_neighbors == opposite_vertices
 
     def _is_boundary_vertex(self, v):
-        """Vérifie si le sommet v appartient à au moins une arête de bord (1 seule face incidente)."""
+        """[TOPOLOGIE] Vérifie en O(1) si le sommet v appartient à au moins une arête de bord."""
         for nbr in self.vertex_neighbors.get(v, ()):
             edge = (v, nbr) if v < nbr else (nbr, v)
             faces = self.edge_faces.get(edge)
@@ -409,7 +427,7 @@ class ProgressiveMesh(obja.Model):
         return False
 
     def is_valid_collapse(self, vs, vt, candidate=None):
-        """Applique les contrôles de bord, manifold, link et retournement."""
+        """[GÉOMÉTRIE & TOPOLOGIE] Contrôle de bord, manifold, link condition et non-retournement de normales."""
         if vs == vt or not (0 <= vs < len(self.vertices)) or not (0 <= vt < len(self.vertices)):
             return False
         edge = tuple(sorted((vs, vt)))
@@ -469,22 +487,26 @@ class ProgressiveMesh(obja.Model):
 
         return True
 
-    # File de priorité et contraction
+    # ==================================================================
+    # [FILE DE PRIORITÉ & CONTRACTION PROGRESSIVE] Gestion du tas et collapses
+    # ==================================================================
     def _push_edge(self, edge):
-        """Calcule la priorité de l'arête et l'insère dans le tas avec versionnage par arête."""
+        """[FILE] Calcule la priorité de l'arête (QEM ou Hoppe) et l'insère dans le tas."""
         ver = self._edge_versions.get(edge, 0) + 1
         self._edge_versions[edge] = ver
         if self.use_qem:
+            # [QEM] Priorité basée sur l'erreur quadrique v^T Q v (+ saillance facultative)
             candidate, cost = self._candidate_position(*edge)
             heapq.heappush(self._heap, (cost, edge, ver, candidate))
         else:
+            # [HOPPE] Priorité basée sur la longueur/énergie de l'arête
             first, second = self.vertices[edge[0]], self.vertices[edge[1]]
             diff = first - second
             priority = float(np.dot(diff, diff))
             heapq.heappush(self._heap, (priority, edge, ver, None))
 
     def _build_priority_queue(self):
-        """Classe les arêtes par coût (QEM Garland 1997 ou longueur)."""
+        """[FILE] Construit la file de priorité initiale."""
         self._heap = []
         self._edge_versions = {}
         self._pending_candidate = None
@@ -495,7 +517,7 @@ class ProgressiveMesh(obja.Model):
             self._push_edge(edge)
 
     def shortest_edge(self):
-        """Retourne l'arête valide d'énergie/erreur minimale."""
+        """[FILE] Extrait l'arête valide de coût minimal (tas-min)."""
         if not self._heap:
             self._build_priority_queue()
         while self._heap:
@@ -517,7 +539,7 @@ class ProgressiveMesh(obja.Model):
         return None
 
     def collapse_edge(self, vs, vt):
-        """Contracte vs vers vt et enregistre toutes les données du split (mise à jour topologique locale O(1))."""
+        """[STRUCTURE] Contracte vs vers vt et met à jour localement la topologie en O(1)."""
         edge = (vs, vt) if vs < vt else (vt, vs)
         if self._pending_edge == edge and self._pending_candidate is not None:
             candidate, cost = self._pending_candidate
@@ -698,14 +720,16 @@ class ProgressiveMesh(obja.Model):
             self.vertex_split()
         return self
 
-    # Export du maillage courant et de la séquence progressive dans le fichier .obja
+    # ==================================================================
+    # [EXPORT OBJA] Écriture progressive (Maillage base M^0 + vertex splits)
+    # ==================================================================
     @staticmethod
     def _clean_coords(position, decimals=6):
-        """Formate proprement les coordonnées flottantes pour éviter le bruit sur 18 décimales dans l'OBJA."""
+        """[EXPORT OBJA] Formate proprement les coordonnées flottantes pour éviter le bruit sur 18 décimales."""
         return [round(float(c), decimals) for c in position]
 
     def write_obja(self, output, decimals=6):
-        """Écrit le niveau courant puis les opérations de reconstruction progressive dans l'OBJA."""
+        """[EXPORT OBJA] Écrit le maillage de base M^0 puis les vertex splits progressifs dans l'OBJA."""
         output_model = obja.Output(output, random_color=False)
         emitted_positions = {}
         ev_written = 0
@@ -764,14 +788,18 @@ class ProgressiveMesh(obja.Model):
             "ev_skipped": ev_skipped,
         }
 
-    # Quantification géométrique appliquée directement au maillage et à l'historique OBJA
+    # ==================================================================
+    # [QUANTIFICATION] Encodage et réduction du nombre de bits des coordonnées 3D
+    # ==================================================================
     @staticmethod
     def _validate_bits(bits):
+        """[QUANTIFICATION] Valide que le nombre de bits est compris entre 1 et 32."""
         if not isinstance(bits, int) or not 1 <= bits <= 32:
             raise ValueError("bits doit être un entier compris entre 1 et 32.")
 
     @staticmethod
     def _quantize_positions(positions, bits):
+        """[QUANTIFICATION] Projette un ensemble de positions 3D sur une grille discrète à (2^bits - 1) niveaux."""
         ProgressiveMesh._validate_bits(bits)
         values = np.asarray(positions, dtype=float)
         if values.size == 0:
@@ -787,7 +815,7 @@ class ProgressiveMesh(obja.Model):
 
     @staticmethod
     def dequantize_vertices(data, bounds, bits=16):
-        """Reconstruit des positions flottantes à partir de positions quantifiées."""
+        """[QUANTIFICATION] Reconstruit des positions flottantes à partir de positions quantifiées."""
         ProgressiveMesh._validate_bits(bits)
         minimum, maximum = (
             np.asarray(value, dtype=float) for value in bounds
@@ -797,7 +825,7 @@ class ProgressiveMesh(obja.Model):
         return minimum + np.asarray(data, dtype=float) / scale * extent
 
     def quantize_vertices(self, bits=16):
-        """Quantifie puis déquantifie les vertices du maillage courant."""
+        """[QUANTIFICATION] Quantifie puis déquantifie les sommets du maillage courant."""
         quantized, minimum, maximum = self._quantize_positions(
             self.vertices,
             bits
@@ -812,7 +840,7 @@ class ProgressiveMesh(obja.Model):
         return quantized, (minimum, maximum)
 
     def quantize_history(self, bits=16):
-        """Retourne les positions quantifiées de l'historique."""
+        """[QUANTIFICATION] Retourne les positions quantifiées de l'historique."""
         positions = []
         for collapse in self.history:
             positions.extend([
@@ -829,7 +857,7 @@ class ProgressiveMesh(obja.Model):
 
     def quantize_model(self, bits=16, decimals=6):
         """
-        Quantifie puis déquantifie sur une boîte englobante globale l'ensemble des
+        [QUANTIFICATION] Quantifie puis déquantifie sur une boîte englobante globale l'ensemble des
         positions du maillage de base (self.vertices) ET de l'historique (self.history)
         pour que l'export .obja écrive directement les coordonnées quantifiées.
         """
@@ -884,6 +912,9 @@ class ProgressiveMesh(obja.Model):
         }
 
 
+# ======================================================================
+# [EXÉCUTION & CLI MULTI-MODES] Orchestration (Hoppe, QEM, Saillance, Quantifié)
+# ======================================================================
 def run_simplification(
     model_path,
     ratio=0.1,
@@ -896,7 +927,7 @@ def run_simplification(
     decimals=6,
     output_obja=None
 ):
-    """Exécute une simplification progressive selon le mode ou les options spécifiées."""
+    """[EXÉCUTION] Exécute une simplification progressive selon le mode choisi."""
     # Détermination de la catégorie et des paramètres selon le mode
     if mode == "hoppe":
         category = "hoppe"
