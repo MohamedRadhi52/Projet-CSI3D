@@ -12,54 +12,7 @@ import numpy as np
 import obja
 import comparaison
 import saillance
-
-
-# ----------------------------------------------------------------------
-# Quadriques d'Erreur (Garland & Heckbert, SIGGRAPH 1997)
-# Représentation compacte symétrique 4x4 en 10 flottants
-# ----------------------------------------------------------------------
-def plane_to_quadric10(a: float, b: float, c: float, d: float, weight: float = 1.0) -> list[float]:
-    """Construit les 10 coefficients symétriques de la quadrique fondamentale weight * p p^T."""
-    return [
-        weight * a * a,
-        weight * a * b,
-        weight * a * c,
-        weight * a * d,
-        weight * b * b,
-        weight * b * c,
-        weight * b * d,
-        weight * c * c,
-        weight * c * d,
-        weight * d * d,
-    ]
-
-
-def eval_quadric10(q: list[float], x: float, y: float, z: float) -> float:
-    """Évalue v^T Q v via la formule développée de Garland (1997, §4 note 2)."""
-    val = (
-        q[0] * x * x
-        + 2.0 * q[1] * x * y
-        + 2.0 * q[2] * x * z
-        + 2.0 * q[3] * x
-        + q[4] * y * y
-        + 2.0 * q[5] * y * z
-        + 2.0 * q[6] * y
-        + q[7] * z * z
-        + 2.0 * q[8] * z
-        + q[9]
-    )
-    return val if val > 0.0 else 0.0
-
-
-def add_quadric10_inplace(dst: list[float], src: list[float]) -> None:
-    """Accumule dst += src sur les 10 coefficients symétriques."""
-    for i in range(10):
-        dst[i] += src[i]
-
-
-def sum_quadric10(q1: list[float], q2: list[float]) -> list[float]:
-    """Retourne q1 + q2 sous forme de liste de 10 flottants."""
-    return [q1[i] + q2[i] for i in range(10)]
+import qem
 
 
 class Collapse:
@@ -135,75 +88,21 @@ class ProgressiveMesh(obja.Model):
         self._visible_face_count = None
 
     # ------------------------------------------------------------------
-    # Structures de voisinage et Quadrics (Garland & Heckbert 1997)
+    # Structures Quadrics QEM (Garland & Heckbert 1997 via qem.py)
     # ------------------------------------------------------------------
     def compute_initial_quadrics(self):
-        """Initialise les quadriques 10-float par sommet selon Garland & Heckbert (1997)."""
-        num_v = len(self.vertices)
-        self.quadrics10 = [[0.0] * 10 for _ in range(num_v)]
-
-        # 1. Quadriques des faces (pondérées par l'aire du triangle)
-        for face in self.faces:
-            if not face.visible:
-                continue
-            p0 = self.vertices[face.a]
-            p1 = self.vertices[face.b]
-            p2 = self.vertices[face.c]
-            normal = np.cross(p1 - p0, p2 - p0)
-            norm = float(np.linalg.norm(normal))
-            if norm <= 1e-12:
-                continue
-            normal /= norm
-            area = 0.5 * norm
-            d = -float(np.dot(normal, p0))
-            kq = plane_to_quadric10(normal[0], normal[1], normal[2], d, weight=area)
-            add_quadric10_inplace(self.quadrics10[face.a], kq)
-            add_quadric10_inplace(self.quadrics10[face.b], kq)
-            add_quadric10_inplace(self.quadrics10[face.c], kq)
-
-        # 2. Plans de contrainte perpendiculaires sur les bords (Garland §6)
-        if self.boundary_weight > 0.0:
-            for edge, faces in self.edge_faces.items():
-                if len(faces) == 1:
-                    u, w = edge
-                    pu, pw = self.vertices[u], self.vertices[w]
-                    edge_vec = pw - pu
-                    edge_len = float(np.linalg.norm(edge_vec))
-                    if edge_len <= 1e-12:
-                        continue
-                    face_idx = next(iter(faces))
-                    f = self.faces[face_idx]
-                    fn = np.cross(self.vertices[f.b] - self.vertices[f.a], self.vertices[f.c] - self.vertices[f.a])
-                    fn_norm = float(np.linalg.norm(fn))
-                    if fn_norm <= 1e-12:
-                        continue
-                    fn /= fn_norm
-                    # Plan perpendiculaire à la face passant par l'arête de bord
-                    perp = np.cross(edge_vec, fn)
-                    perp_norm = float(np.linalg.norm(perp))
-                    if perp_norm <= 1e-12:
-                        continue
-                    perp /= perp_norm
-                    d_perp = -float(np.dot(perp, pu))
-                    kq_bnd = plane_to_quadric10(perp[0], perp[1], perp[2], d_perp, weight=self.boundary_weight * edge_len)
-                    add_quadric10_inplace(self.quadrics10[u], kq_bnd)
-                    add_quadric10_inplace(self.quadrics10[w], kq_bnd)
+        """Initialise les quadriques 10-float via le module qem (Garland & Heckbert 1997)."""
+        self.quadrics10 = qem.compute_initial_quadrics(
+            self.vertices, self.faces, self.edge_faces, self.boundary_weight
+        )
 
     def qem_cost(self, a, b, position):
-        """Évalue l'erreur quadrique QEM (Garland 1997) + hook saillance pour le collègue."""
+        """Évalue l'erreur quadrique QEM (Garland 1997) + saillance facultative."""
         if not self.quadrics10 or len(self.quadrics10) != len(self.vertices):
             self.compute_initial_quadrics()
-        q_sum = sum_quadric10(self.quadrics10[a], self.quadrics10[b])
-        cost = eval_quadric10(q_sum, float(position[0]), float(position[1]), float(position[2]))
-
-        # Hook pour la saillance (Papier 3 - Limper 2016)
-        if self.saliency_weight > 0.0 and self.vertex_saliency is not None:
-            sal_a = self.vertex_saliency[a] if a < len(self.vertex_saliency) else 0.0
-            sal_b = self.vertex_saliency[b] if b < len(self.vertex_saliency) else 0.0
-            sal_edge = 0.5 * (sal_a + sal_b)
-            cost *= (1.0 + self.saliency_weight * sal_edge)
-
-        return cost
+        return qem.eval_edge_cost(
+            self.quadrics10, a, b, position, self.saliency_weight, self.vertex_saliency
+        )
 
     def _visible_face_vertices(self, face):
         return (face.a, face.b, face.c)
@@ -448,25 +347,27 @@ class ProgressiveMesh(obja.Model):
         )
 
     def _candidate_position(self, a, b):
-        """Calcule la position qui minimise l'erreur (QEM Garland 1997 ou Énergie Hoppe 1996)."""
+        """Calcule la position optimale : QEM (Garland 1997 via qem.py) ou Énergie originale (Hoppe 1996)."""
+        if self.use_qem:
+            if not self.quadrics10:
+                self.compute_initial_quadrics()
+            return qem.optimal_candidate_position(
+                self.quadrics10, self.vertices, a, b, self.saliency_weight, self.vertex_saliency
+            )
+
+        # Méthode originale de Hoppe (1996) basée sur l'énergie totale (distance + ressort + discontinuité)
         candidates = [
             self.vertices[a],
             self.vertices[b],
             (self.vertices[a] + self.vertices[b]) / 2.0
         ]
-
         best_position = candidates[0]
         best_cost = float("inf")
         for position in candidates:
-            if self.use_qem:
-                cost = self.qem_cost(a, b, position)
-            else:
-                cost = self._total_collapse_energy(a, b, position)
-
+            cost = self._total_collapse_energy(a, b, position)
             if np.isfinite(cost) and cost < best_cost:
                 best_position = position
                 best_cost = cost
-
         return np.asarray(best_position, dtype=float), max(0.0, best_cost)
 
     def edge_length(self, a, b):
@@ -712,8 +613,7 @@ class ProgressiveMesh(obja.Model):
 
         self.vertices[vt] = candidate
         if self.use_qem and self.quadrics10:
-            add_quadric10_inplace(self.quadrics10[vt], self.quadrics10[vs])
-            self.quadrics10[vs] = [0.0] * 10
+            qem.update_quadrics_on_collapse(self.quadrics10, vs, vt)
 
         self.history.append(
             Collapse(
