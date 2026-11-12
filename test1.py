@@ -728,20 +728,37 @@ class ProgressiveMesh(obja.Model):
         """[EXPORT OBJA] Formate proprement les coordonnées flottantes pour éviter le bruit sur 18 décimales."""
         return [round(float(c), decimals) for c in position]
 
-    def write_obja(self, output, decimals=6):
-        """[EXPORT OBJA] Écrit le maillage de base M^0 puis les vertex splits progressifs dans l'OBJA."""
+    
+    def write_obja(self, output, decimals=6, bits=16):
+        self._validate_bits(bits)
+
         output_model = obja.Output(output, random_color=False)
+
+        vertex_size = (3 * bits + 7) // 8
+        face_size = 7
+        edit_face_size = 5
+
+        cumulative_size = 0
         emitted_positions = {}
+        emitted_faces = set()
+
         ev_written = 0
         ev_skipped = 0
 
+        def write_size():
+            print(f"s {cumulative_size}", file=output)
+
         def ensure_vertex(vertex_id, position=None):
+            nonlocal cumulative_size
+
             if vertex_id not in output_model.vertex_mapping:
                 if position is None:
                     position = self.vertices[vertex_id]
+
                 clean_pos = self._clean_coords(position, decimals)
                 output_model.add_vertex(vertex_id, clean_pos)
                 emitted_positions[vertex_id] = clean_pos
+                cumulative_size += vertex_size
 
         def ensure_face_vertices(face):
             ensure_vertex(face.a)
@@ -749,6 +766,7 @@ class ProgressiveMesh(obja.Model):
             ensure_vertex(face.c)
 
         used_vertices = set()
+
         for face in self.faces:
             if face.visible:
                 used_vertices.update(self._visible_face_vertices(face))
@@ -756,37 +774,66 @@ class ProgressiveMesh(obja.Model):
         for vertex_id in sorted(used_vertices):
             ensure_vertex(vertex_id)
 
-        emitted_faces = set()
         for face_index, face in enumerate(self.faces):
             if face.visible:
                 output_model.add_face(face_index, face)
                 emitted_faces.add(face_index)
+                cumulative_size += face_size
+
+        write_size()
 
         for collapse in reversed(self.history):
-            ensure_vertex(collapse.vertex_id, collapse.vertex_position)
-            target_clean = self._clean_coords(collapse.target_vertex_position, decimals)
+            ensure_vertex(
+                collapse.vertex_id,
+                collapse.vertex_position
+            )
+
+            target_clean = self._clean_coords(
+                collapse.target_vertex_position,
+                decimals
+            )
+
             if collapse.target_vertex_id not in output_model.vertex_mapping:
-                ensure_vertex(collapse.target_vertex_id, target_clean)
+                ensure_vertex(
+                    collapse.target_vertex_id,
+                    target_clean
+                )
+
             elif emitted_positions.get(collapse.target_vertex_id) != target_clean:
-                output_model.edit_vertex(collapse.target_vertex_id, target_clean)
+                output_model.edit_vertex(
+                    collapse.target_vertex_id,
+                    target_clean
+                )
+
                 emitted_positions[collapse.target_vertex_id] = target_clean
+                cumulative_size += vertex_size
                 ev_written += 1
+
             else:
                 ev_skipped += 1
 
-            for face_index, old_face, _ in collapse.modified_faces:
+            for face_index, old_face, new_face in collapse.modified_faces:
                 if face_index in emitted_faces:
                     ensure_face_vertices(old_face)
+
                     output_model.edit_face(face_index, old_face)
+                    cumulative_size += edit_face_size
+
             for face_index, old_face in collapse.removed_faces:
                 ensure_face_vertices(old_face)
+
                 output_model.add_face(face_index, old_face)
                 emitted_faces.add(face_index)
+                cumulative_size += face_size
+
+            write_size()
 
         self._last_obja_stats = {
             "ev_written": ev_written,
             "ev_skipped": ev_skipped,
+            "estimated_size": cumulative_size
         }
+
 
     # ==================================================================
     # [QUANTIFICATION] Encodage et réduction du nombre de bits des coordonnées 3D
@@ -1028,7 +1075,7 @@ def run_simplification(
     obja_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(obja_path, "w", encoding="utf-8") as file:
-        model.write_obja(file, decimals=decimals)
+        model.write_obja(file,decimals=decimals,bits=bits)
     obja_bytes = obja_path.stat().st_size
     ev_stats = getattr(model, "_last_obja_stats", {"ev_written": 0, "ev_skipped": 0})
     print(f"\n[4] Export OBJA progressif :")
