@@ -163,31 +163,106 @@ Element.SetFaceColor = "SetFaceColor";
 Element.PredictVertex = "PredictVertex";
 
 class Loader {
-    constructor(path, chunkSize = 1024, timeout = 20) {
+    constructor(path, chunkSize = 1024, timeout = 20, options = {}) {
         this.path = path;
+        this.baseChunkSize = chunkSize;
         this.chunkSize = chunkSize;
+        this.minChunkSize = options.minChunkSize || 512;
+        this.maxChunkSize = options.maxChunkSize || 32768;
+        this.targetWindowSec = options.targetWindowSec || 0.15;
+        this.qosEnabled = options.qosEnabled !== undefined ? options.qosEnabled : true;
+        this.simulatedKbps = options.simulatedKbps || 0; // 0 = réseau réel
         this.timeout = timeout;
         this.currentByte = 0;
         this.remainder = "";
+        this.paused = false;
+        this.activeCallback = null;
+        this.timeoutId = null;
+        this.estimatedBps = null;
+        this.lastChunkSize = chunkSize;
+        this.requestCount = 0;
+        this.startTime = null;
+        this.finished = false;
+        this.elapsedMs = 0;
     }
 
     start(callback) {
+        this.activeCallback = callback;
+        this.startTime = performance.now();
         fetchDataLength(this.path, (length) => {
-            this.dataLength = length;
+            this.dataLength = parseInt(length, 10) || 0;
             this.next(callback);
         });
     }
 
     percentage() {
+        if (!this.dataLength) return 0;
         return 100 * this.currentByte / this.dataLength;
     }
 
+    setQosEnabled(enabled) {
+        this.qosEnabled = Boolean(enabled);
+        if (!this.qosEnabled) {
+            this.chunkSize = this.baseChunkSize;
+        }
+    }
+
+    setSimulatedKbps(kbps) {
+        this.simulatedKbps = Number(kbps) || 0;
+        this.estimatedBps = null;
+    }
+
+    _updateQosBandwidth(bytesReceived, measuredMs) {
+        let effectiveMs = Math.max(1.0, measuredMs);
+        if (this.simulatedKbps > 0) {
+            const simMs = (bytesReceived * 8.0 * 1000.0) / (this.simulatedKbps * 1000.0);
+            effectiveMs = Math.max(effectiveMs, simMs);
+        }
+
+        const currentBps = (bytesReceived * 1000.0) / effectiveMs;
+        // Lissage exponentiel du débit effectif (Chen & Nishita 2002, §5.2)
+        this.estimatedBps = this.estimatedBps === null
+            ? currentBps
+            : 0.5 * this.estimatedBps + 0.5 * currentBps;
+
+        if (this.qosEnabled) {
+            const rawTarget = Math.round(this.estimatedBps * this.targetWindowSec);
+            this.chunkSize = Math.max(
+                this.minChunkSize,
+                Math.min(this.maxChunkSize, rawTarget)
+            );
+        } else {
+            this.chunkSize = this.baseChunkSize;
+        }
+    }
+
+    pause() {
+        this.paused = true;
+        if (this.timeoutId) {
+            clearTimeout(this.timeoutId);
+            this.timeoutId = null;
+        }
+    }
+
+    resume() {
+        if (!this.paused) return;
+        this.paused = false;
+        if (this.activeCallback) {
+            this.next(this.activeCallback);
+        }
+    }
+
     next(callback) {
-        this.downloadAndParseNextChunk((data) => {
+        this.activeCallback = callback;
+        if (this.paused || this.finished) return;
+
+        this.downloadAndParseNextChunk((data, waitMs) => {
             callback(data);
-            setTimeout(() => {
+            if (this.paused || this.finished) return;
+            const delay = Math.max(this.timeout, waitMs || 0);
+            this.timeoutId = setTimeout(() => {
                 this.next(callback);
-            }, this.timeout);
+            }, delay);
         });
     }
 
@@ -196,15 +271,36 @@ class Loader {
         let upperBound = Math.min(this.currentByte + this.chunkSize, this.dataLength);
 
         if (upperBound <= this.currentByte) {
+            this.finished = true;
+            if (this.startTime !== null) {
+                this.elapsedMs = performance.now() - this.startTime;
+            }
             if (this.remainder !== "") {
-                callback([parseLine(this.remainder, 0)]);
+                const last = this.remainder;
+                this.remainder = "";
+                callback([parseLine(last, 0)], 0);
             }
             return;
         }
 
-        fetchData(this.path, this.currentByte, upperBound, (data) => {
+        const bytesToFetch = upperBound - this.currentByte;
+        const t0 = performance.now();
 
+        fetchData(this.path, this.currentByte, upperBound, (data) => {
+            const measuredMs = performance.now() - t0;
+            this.lastChunkSize = bytesToFetch;
+            this.requestCount += 1;
             this.currentByte = upperBound;
+            this.elapsedMs = performance.now() - this.startTime;
+
+            let simDelayMs = 0;
+            if (this.simulatedKbps > 0) {
+                simDelayMs = Math.max(
+                    0,
+                    (bytesToFetch * 8.0 * 1000.0) / (this.simulatedKbps * 1000.0) - measuredMs
+                );
+            }
+            this._updateQosBandwidth(bytesToFetch, measuredMs);
 
             let elements = [];
             let split = data.split('\n');
@@ -215,7 +311,15 @@ class Loader {
                 elements.push(parseLine(split[i], i));
             }
 
-            callback(elements);
+            if (this.currentByte >= this.dataLength) {
+                this.finished = true;
+                if (this.remainder !== "") {
+                    elements.push(parseLine(this.remainder, split.length));
+                    this.remainder = "";
+                }
+            }
+
+            callback(elements, simDelayMs);
 
         });
     }
