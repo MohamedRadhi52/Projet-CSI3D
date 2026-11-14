@@ -3,7 +3,7 @@ import unittest
 
 import numpy as np
 
-from test1 import ProgressiveMesh
+from progressive_mesh import ProgressiveMesh
 
 
 class ChenNishitaTests(unittest.TestCase):

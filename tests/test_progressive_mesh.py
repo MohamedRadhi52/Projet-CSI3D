@@ -6,7 +6,7 @@ import numpy as np
 
 import obja
 from comparaison import compare_models
-from test1 import ProgressiveMesh
+from progressive_mesh import ProgressiveMesh
 
 
 class ProgressiveMeshTests(unittest.TestCase):
