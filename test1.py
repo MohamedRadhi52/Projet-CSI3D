@@ -84,7 +84,7 @@ class ProgressiveMesh(obja.Model):
         self.use_qem = False if self.use_chen else bool(use_qem)
         self.boundary_weight = float(boundary_weight)
         self.saliency_weight = float(saliency_weight)
-        self.vertex_saliency = None  # Point d'ancrage pour le collègue (Saillance LCE)
+        self.vertex_saliency = None  
         self.quadrics10 = []
         self._chen_face_normals = {}
         self._chen_unremovable = set()
@@ -385,7 +385,7 @@ class ProgressiveMesh(obja.Model):
             return position, cost
 
         if self.use_qem:
-            # Branche QEM (avec hook saillance Limper 2016 facultatif)
+            # Branche QEM 
             if not self.quadrics10:
                 self.compute_initial_quadrics()
             return qem.optimal_candidate_position(
